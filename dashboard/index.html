@@ -1,0 +1,1713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NIFTY Spread Bot</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body   { background: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', monospace; font-size: 13px; }
+
+    /* ── Header ── */
+    header { background: #161b22; padding: 12px 20px; border-bottom: 1px solid #30363d;
+             display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    header h1 { font-size: 17px; color: #58a6ff; }
+    .badge { padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+    .badge-paper { background: #388bfd22; color: #58a6ff; border: 1px solid #388bfd66; }
+    .badge-live  { background: #2ea04326; color: #3fb950; border: 1px solid #2ea04366; }
+    .badge-ok    { background: #2ea04320; color: #3fb950; border: 1px solid #2ea04355; }
+    .badge-err   { background: #da36361a; color: #f85149; border: 1px solid #da363655; }
+    #status-dot  { width: 8px; height: 8px; border-radius: 50%; background: #3fb950;
+                   animation: pulse 1.5s infinite; flex-shrink: 0; }
+    #status-dot.halt    { background: #f85149; }
+    #status-dot.caution { background: #e3b341; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+    /* Regime banner */
+    .regime-banner { margin-bottom: 16px; padding: 12px 16px; border-radius: 8px;
+                     font-size: 12px; line-height: 1.7; display: none; }
+    .regime-banner.caution { background: #e3b34115; border: 1px solid #e3b34155; color: #e3b341; }
+    .regime-banner.halt    { background: #da363615; border: 1px solid #da363655; color: #f85149; }
+    .regime-banner b       { font-size: 13px; }
+    .regime-banner .reason { margin-top: 6px; color: #c9d1d9; font-size: 11px; line-height: 1.6; }
+
+    /* ── Tabs ── */
+    .tabs { background: #161b22; border-bottom: 1px solid #30363d;
+            display: flex; padding: 0 20px; overflow-x: auto; }
+    .tab  { padding: 10px 18px; font-size: 12px; cursor: pointer; color: #8b949e;
+            border-bottom: 2px solid transparent; transition: all 0.15s; white-space: nowrap; }
+    .tab:hover  { color: #c9d1d9; }
+    .tab.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+    .panel      { display: none; padding: 16px 20px 24px; }
+    .panel.active { display: block; }
+
+    /* ── Cards ── */
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
+    .card .label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; }
+    .card .value { font-size: 22px; font-weight: bold; margin-top: 4px; color: #e6edf3; }
+    .card .sub   { font-size: 11px; color: #8b949e; margin-top: 2px; }
+
+    /* ── Signal box ── */
+    .signal-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+                  padding: 14px; margin-bottom: 16px; }
+    .signal-box h2 { font-size: 11px; color: #8b949e; text-transform: uppercase;
+                     letter-spacing: .5px; margin-bottom: 10px; }
+    .sig-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .sig-pill { padding: 4px 14px; border-radius: 20px; font-size: 12px; font-weight: bold; }
+    .sig-none { background: #21262d; color: #8b949e; }
+    .sig-sell { background: #da36361a; color: #f85149; border: 1px solid #da363655; }
+    .sig-buy  { background: #2ea04320; color: #3fb950; border: 1px solid #2ea04355; }
+    .sig-arb  { background: #e3b34120; color: #e3b341; border: 1px solid #e3b34155; }
+
+    /* ── Charts ── */
+    .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    .chart-box { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 14px; }
+    .chart-box h3 { font-size: 11px; color: #8b949e; text-transform: uppercase;
+                    letter-spacing: .5px; margin-bottom: 10px; }
+    canvas { max-height: 200px; }
+
+    /* ── Tables ── */
+    .table-wrap { overflow-x: auto; }
+    table  { width: 100%; border-collapse: collapse; }
+    thead tr { background: #161b22; border-bottom: 1px solid #30363d; }
+    th { padding: 8px 10px; text-align: left; font-size: 11px; color: #8b949e;
+         text-transform: uppercase; letter-spacing: .4px; white-space: nowrap; }
+    td { padding: 7px 10px; border-bottom: 1px solid #21262d; font-size: 12px; white-space: nowrap; }
+    tr:hover td { background: #1c2128; }
+    .up   { color: #3fb950; }
+    .down { color: #f85149; }
+    .warn { color: #e3b341; }
+
+    /* ── Buttons ── */
+    .btn { padding: 6px 16px; border-radius: 6px; border: none; cursor: pointer;
+           font-size: 12px; font-weight: 600; transition: opacity 0.15s; }
+    .btn:hover:not(:disabled) { opacity: 0.8; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-primary   { background: #238636; color: #fff; }
+    .btn-danger    { background: #da3633; color: #fff; }
+    .btn-warn      { background: #e3b341; color: #000; }
+    .btn-secondary { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+    .btn-sm { padding: 3px 10px; font-size: 11px; }
+
+    /* ── Forms ── */
+    .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 12px; }
+    .form-group { display: flex; flex-direction: column; gap: 4px; }
+    .form-group label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; }
+    .form-group input, .form-group select {
+      background: #21262d; border: 1px solid #30363d; border-radius: 6px;
+      color: #c9d1d9; padding: 7px 10px; font-size: 12px; width: 100%;
+    }
+    .form-group input:focus, .form-group select:focus { outline: none; border-color: #58a6ff; }
+    .section-head { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: .5px;
+                    margin: 20px 0 12px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
+
+    /* ── Toggle ── */
+    .toggle-wrap { display: flex; align-items: center; gap: 10px; }
+    .toggle { position: relative; width: 44px; height: 22px; flex-shrink: 0; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .toggle-slider { position: absolute; inset: 0; background: #30363d; border-radius: 11px;
+                     cursor: pointer; transition: background 0.2s; }
+    .toggle-slider::before { content: ''; position: absolute; width: 16px; height: 16px;
+                              left: 3px; top: 3px; background: #8b949e; border-radius: 50%;
+                              transition: transform 0.2s, background 0.2s; }
+    .toggle input:checked + .toggle-slider { background: #238636; }
+    .toggle input:checked + .toggle-slider::before { transform: translateX(22px); background: #fff; }
+
+    /* ── Grid layout for control/order panels ── */
+    .ctrl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+    .ctrl-box  { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+    .ctrl-box h3 { font-size: 11px; color: #8b949e; text-transform: uppercase;
+                   letter-spacing: .5px; margin-bottom: 14px; }
+
+    /* ── Position cards ── */
+    .pos-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+                padding: 14px; margin-bottom: 10px; }
+    .pos-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .pos-body { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
+    .pos-field .fl { font-size: 10px; color: #8b949e; text-transform: uppercase; }
+    .pos-field .fv { font-size: 12px; color: #e6edf3; margin-top: 2px; }
+
+    /* ── Toast ── */
+    #toast { position: fixed; bottom: 24px; right: 24px; padding: 10px 20px;
+             border-radius: 8px; font-size: 12px; font-weight: 600; opacity: 0;
+             transition: opacity 0.3s; pointer-events: none; z-index: 999; max-width: 320px; }
+    #toast.show    { opacity: 1; }
+    #toast.success { background: #2ea04326; color: #3fb950; border: 1px solid #2ea04355; }
+    #toast.error   { background: #da36361a; color: #f85149; border: 1px solid #da363655; }
+
+    /* ── Daily Plan tab ── */
+    .plan-hero { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+                 padding: 20px 24px; margin-bottom: 16px; }
+    .plan-emoji  { font-size: 40px; line-height: 1; }
+    .plan-name   { font-size: 22px; font-weight: bold; margin-top: 6px; color: #e6edf3; }
+    .plan-reason { font-size: 13px; color: #c9d1d9; margin-top: 8px; line-height: 1.7; }
+    .plan-risk   { font-size: 12px; color: #8b949e; margin-top: 8px; line-height: 1.6; padding-top: 8px;
+                   border-top: 1px solid #21262d; }
+    .plan-legs   { background: #0d1117; border: 1px solid #21262d; border-radius: 8px;
+                   padding: 14px; margin-top: 14px; font-family: monospace; font-size: 13px; line-height: 2; }
+    .plan-leg    { display: flex; align-items: center; gap: 10px; }
+    .plan-leg-buy  { color: #3fb950; }
+    .plan-leg-sell { color: #f85149; }
+    .plan-stats  { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-top: 14px; }
+    .plan-stat   { background: #0d1117; border: 1px solid #21262d; border-radius: 6px; padding: 10px 12px; }
+    .plan-stat .ps-label { font-size: 10px; color: #484f58; text-transform: uppercase; letter-spacing: .5px; }
+    .plan-stat .ps-value { font-size: 16px; font-weight: bold; margin-top: 2px; color: #e6edf3; }
+    /* strategy colours */
+    .plan-WAIT             { border-left: 4px solid #30363d; }
+    .plan-TRIPLE_CALENDAR  { border-left: 4px solid #58a6ff; }
+    .plan-ARB_SYNTHETIC    { border-left: 4px solid #e3b341; }
+    .plan-BUY_STRADDLE     { border-left: 4px solid #3fb950; }
+    .plan-SELL_STRADDLE    { border-left: 4px solid #f85149; }
+    .plan-BUY_STRANGLE     { border-left: 4px solid #bc8cff; }
+
+    /* ── Intraday plan card ── */
+    .intraday-card { background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+                     padding: 20px 24px; margin-top: 16px; }
+    .intraday-card h2 { font-size: 14px; font-weight: bold; color: #8b949e;
+                        text-transform: uppercase; letter-spacing: .6px; margin-bottom: 14px; }
+    .intraday-strategy { font-size: 20px; font-weight: bold; color: #e6edf3; margin-bottom: 6px; }
+    .intraday-reason   { font-size: 13px; color: #c9d1d9; line-height: 1.7; margin-bottom: 12px; }
+    .intraday-meta     { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                         gap: 8px; margin-top: 12px; }
+    .intraday-meta-item { background: #0d1117; border: 1px solid #21262d; border-radius: 6px;
+                          padding: 8px 12px; }
+    .intraday-meta-item .im-label { font-size: 10px; color: #484f58; text-transform: uppercase; letter-spacing: .5px; }
+    .intraday-meta-item .im-value { font-size: 14px; font-weight: bold; color: #e6edf3; margin-top: 2px; }
+    .intraday-notes    { margin-top: 12px; font-size: 12px; line-height: 1.8; color: #8b949e;
+                         border-top: 1px solid #21262d; padding-top: 12px; }
+    .intraday-notes b  { color: #c9d1d9; }
+    /* intraday strategy border colours */
+    .intraday-WAIT          { border-left: 4px solid #30363d; }
+    .intraday-BUY_STRADDLE  { border-left: 4px solid #3fb950; }
+    .intraday-BUY_STRANGLE  { border-left: 4px solid #bc8cff; }
+    .intraday-BUY_CE        { border-left: 4px solid #58a6ff; }
+    .intraday-BUY_PE        { border-left: 4px solid #f0883e; }
+    .intraday-SELL_STRADDLE { border-left: 4px solid #f85149; }
+    .intraday-SELL_STRANGLE { border-left: 4px solid #e3b341; }
+
+    /* ── Volatility tab ── */
+    .vol-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .vol-card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 12px; }
+    .vol-card .label { font-size: 10px; color: #8b949e; text-transform: uppercase; letter-spacing: .5px; }
+    .vol-card .value { font-size: 20px; font-weight: bold; margin-top: 3px; color: #e6edf3; }
+    .vol-card .sub   { font-size: 11px; color: #8b949e; margin-top: 2px; }
+
+    footer { text-align: center; padding: 12px; color: #484f58; font-size: 11px; }
+    @media (max-width: 640px) {
+      .charts, .ctrl-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div id="status-dot"></div>
+  <h1>NIFTY Spread Bot</h1>
+  <span class="badge badge-paper" id="mode-badge">PAPER</span>
+  <span class="badge badge-ok"    id="broker-badge">Broker –</span>
+  <span style="margin-left:auto; color:#484f58; font-size:11px" id="last-updated">–</span>
+</header>
+
+<div class="tabs">
+  <div class="tab active" data-tab="dailyplan" onclick="switchTab('dailyplan')">📋 Daily Plan</div>
+  <div class="tab"        data-tab="scanner"   onclick="switchTab('scanner')">Scanner</div>
+  <div class="tab"        data-tab="volatility" onclick="switchTab('volatility')">Volatility</div>
+  <div class="tab"        data-tab="positions" onclick="switchTab('positions')">
+    Positions
+    <span id="pos-count-badge" style="display:none; background:#58a6ff33; color:#58a6ff;
+      border-radius:10px; padding:1px 6px; font-size:10px; margin-left:4px;"></span>
+  </div>
+  <div class="tab" data-tab="orders"   onclick="switchTab('orders')">Orders</div>
+  <div class="tab" data-tab="controls" onclick="switchTab('controls')">Controls</div>
+  <div class="tab" data-tab="pnl"      onclick="switchTab('pnl')">P&amp;L</div>
+</div>
+
+<!-- ══════════════════════════ DAILY PLAN ══════════════════════════ -->
+<div class="panel active" id="tab-dailyplan">
+
+  <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+    <span style="font-size:12px; color:#8b949e;" id="plan-updated">–</span>
+    <button class="btn btn-secondary btn-sm" onclick="loadDailyPlan()">↻ Refresh</button>
+  </div>
+
+  <!-- Hero card -->
+  <div class="plan-hero" id="plan-hero">
+    <div class="plan-emoji" id="plan-emoji">⏳</div>
+    <div class="plan-name"  id="plan-name">Loading…</div>
+    <div class="plan-reason" id="plan-reason"></div>
+    <div class="plan-risk"   id="plan-risk"></div>
+
+    <!-- Action legs -->
+    <div class="plan-legs" id="plan-legs" style="display:none;"></div>
+
+    <!-- Mini stats -->
+    <div class="plan-stats">
+      <div class="plan-stat"><div class="ps-label">VIX</div><div class="ps-value" id="ps-vix">–</div></div>
+      <div class="plan-stat"><div class="ps-label">IV–VIX Spread</div><div class="ps-value" id="ps-ivspread">–</div></div>
+      <div class="plan-stat"><div class="ps-label">Market Regime</div><div class="ps-value" id="ps-regime">–</div></div>
+      <div class="plan-stat"><div class="ps-label">Signal Strength</div><div class="ps-value" id="ps-strength">–</div></div>
+      <div class="plan-stat"><div class="ps-label">Est. Capital</div><div class="ps-value" id="ps-capital">–</div></div>
+      <div class="plan-stat"><div class="ps-label">Recommended Qty</div><div class="ps-value" id="ps-qty">–</div></div>
+    </div>
+  </div>
+
+  <!-- Strategy quick-reference legend -->
+  <div class="signal-box" style="margin-top:4px;">
+    <h2>Strategy Guide</h2>
+    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap:10px; margin-top:8px; font-size:12px; line-height:1.8;">
+      <div><span class="sig-pill sig-none" style="display:inline-block; min-width:110px; text-align:center;">⏸️ WAIT</span> &nbsp;No edge — stay flat</div>
+      <div><span class="sig-pill sig-buy"  style="display:inline-block; min-width:110px; text-align:center;">🦋 CALENDAR</span> &nbsp;Calm market, Z-score edge</div>
+      <div><span class="sig-pill sig-arb"  style="display:inline-block; min-width:110px; text-align:center;">⚡ ARB</span> &nbsp;Put-call parity violated</div>
+      <div><span class="sig-pill sig-buy"  style="display:inline-block; min-width:110px; text-align:center;">💥 BUY STRADDLE</span> &nbsp;IV cheap, big move expected</div>
+      <div><span class="sig-pill sig-sell" style="display:inline-block; min-width:110px; text-align:center;">📉 SELL STRADDLE</span> &nbsp;IV overpriced, collect premium</div>
+      <div><span class="sig-pill" style="display:inline-block; min-width:110px; text-align:center; background:#bc8cff22; color:#bc8cff; border:1px solid #bc8cff55;">🌪️ STRANGLE</span> &nbsp;VIX spike, tail-risk protection</div>
+    </div>
+  </div>
+
+  <!-- ── Intraday Recommendation card ── -->
+  <div class="intraday-card intraday-WAIT" id="intraday-card">
+    <h2>📊 Intraday Recommendation <span style="font-weight:normal;text-transform:none;font-size:11px;" id="intraday-generated">— generated at 9:30 AM</span></h2>
+    <div id="intraday-loading" style="color:#484f58; font-size:13px;">Waiting for 9:30 AM market data…</div>
+    <div id="intraday-body" style="display:none;">
+      <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px;">
+        <span style="font-size:32px;" id="intraday-emoji">⏸️</span>
+        <div>
+          <div class="intraday-strategy" id="intraday-strategy">–</div>
+          <div style="font-size:12px;" id="intraday-confidence">–</div>
+        </div>
+      </div>
+      <div class="intraday-reason" id="intraday-reason"></div>
+
+      <!-- Legs -->
+      <div id="intraday-legs-wrap" style="display:none; background:#0d1117; border:1px solid #21262d;
+           border-radius:8px; padding:14px; margin-bottom:12px; font-family:monospace; font-size:13px; line-height:2.2;">
+        <div id="intraday-legs"></div>
+      </div>
+
+      <!-- SL / Target / Entry notes -->
+      <div class="intraday-notes" id="intraday-notes"></div>
+
+      <!-- Metrics row -->
+      <div class="intraday-meta">
+        <div class="intraday-meta-item"><div class="im-label">VIX</div><div class="im-value" id="im-vix">–</div></div>
+        <div class="intraday-meta-item"><div class="im-label">Gap %</div><div class="im-value" id="im-gap">–</div></div>
+        <div class="intraday-meta-item"><div class="im-label">Opening Range</div><div class="im-value" id="im-or">–</div></div>
+        <div class="intraday-meta-item"><div class="im-label">IV–VIX Spread</div><div class="im-value" id="im-ivspread">–</div></div>
+        <div class="intraday-meta-item"><div class="im-label">ATM Strike</div><div class="im-value" id="im-atm">–</div></div>
+        <div class="intraday-meta-item"><div class="im-label">Entry Window</div><div class="im-value" id="im-entry">9:30–10:00 AM</div></div>
+        <div class="intraday-meta-item"><div class="im-label">Hard Exit</div><div class="im-value" id="im-exit">1:30 PM</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════ SCANNER ══════════════════════════ -->
+<div class="panel" id="tab-scanner">
+
+  <!-- Regime banner – shown when CAUTION or HALT -->
+  <div class="regime-banner" id="regime-banner">
+    <b id="regime-banner-title">–</b>
+    <div class="reason" id="regime-banner-body"></div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Near Future</div><div class="value" id="m-near">–</div><div class="sub" id="m-near-sym">–</div></div>
+    <div class="card"><div class="label">Next Future</div><div class="value" id="m-next">–</div><div class="sub" id="m-next-sym">–</div></div>
+    <div class="card"><div class="label">Far Future</div> <div class="value" id="m-far">–</div> <div class="sub" id="m-far-sym">–</div></div>
+    <div class="card"><div class="label">Spread 1</div>   <div class="value" id="m-s1">–</div>  <div class="sub">Next – Near</div></div>
+    <div class="card"><div class="label">Spread 2</div>   <div class="value" id="m-s2">–</div>  <div class="sub">Far – Next</div></div>
+    <div class="card"><div class="label">Curve Diff</div> <div class="value" id="m-cd">–</div>  <div class="sub">S1 – S2</div></div>
+    <div class="card"><div class="label">Z-Score</div>    <div class="value" id="m-zs">–</div>  <div class="sub">±2 = signal</div></div>
+    <div class="card"><div class="label">DTE</div>        <div class="value" id="m-dte">–</div> <div class="sub" id="m-bias">–</div></div>
+    <div class="card">
+      <div class="label">India VIX</div>
+      <div class="value" id="m-vix">–</div>
+      <div class="sub"  id="m-vix-level">–</div>
+    </div>
+    <div class="card">
+      <div class="label">Trade Regime</div>
+      <div class="value" id="m-regime" style="font-size:15px; margin-top:6px;">–</div>
+      <div class="sub"   id="m-regime-sub">–</div>
+    </div>
+  </div>
+
+  <div class="signal-box">
+    <h2>Active Signal</h2>
+    <div class="sig-row">
+      <span id="sig-spread" class="sig-pill sig-none">NO SPREAD SIGNAL</span>
+      <span id="sig-arb"    class="sig-pill sig-none">NO ARB SIGNAL</span>
+      <span style="color:#8b949e">Strength: <b id="sig-strength">–</b>/5</span>
+      <span style="color:#8b949e">Qty: <b id="sig-qty">–</b></span>
+      <span style="color:#f85149">SL diff: <b id="sig-sl">–</b></span>
+      <span style="color:#3fb950">Tgt diff: <b id="sig-tgt">–</b></span>
+      <button class="btn btn-primary btn-sm" style="margin-left:auto"
+              onclick="preloadSignalToOrder()">→ Place Order</button>
+    </div>
+  </div>
+
+  <div class="charts">
+    <div class="chart-box"><h3>Curve Diff (last 60 scans)</h3><canvas id="chart-cdiff"></canvas></div>
+    <div class="chart-box"><h3>Z-Score (last 60 scans)</h3>   <canvas id="chart-zscore"></canvas></div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Near</th><th>Next</th><th>Far</th>
+        <th>S1</th><th>S2</th><th>Diff</th><th>Z</th>
+        <th>OI Roll</th><th>Vol</th>
+        <th>Signal</th><th>Str</th><th>Qty</th>
+        <th>SL</th><th>Tgt</th><th>Arb</th><th>Arb Δ</th>
+        <th>VIX</th><th>Regime</th>
+      </tr></thead>
+      <tbody id="tbl-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ══════════════════════════ VOLATILITY ══════════════════════════ -->
+<div class="panel" id="tab-volatility">
+
+  <div class="vol-grid">
+    <div class="vol-card"><div class="label">Call IV</div>      <div class="value" id="v-call-iv">–</div>  <div class="sub">Annualised %</div></div>
+    <div class="vol-card"><div class="label">Put IV</div>       <div class="value" id="v-put-iv">–</div>   <div class="sub">Annualised %</div></div>
+    <div class="vol-card"><div class="label">Avg IV</div>       <div class="value" id="v-avg-iv">–</div>   <div class="sub">Call+Put avg</div></div>
+    <div class="vol-card"><div class="label">India VIX</div>    <div class="value" id="v-vix">–</div>      <div class="sub">Live</div></div>
+    <div class="vol-card"><div class="label">IV–VIX Spread</div><div class="value" id="v-spread">–</div>  <div class="sub">+4=SELL / -3=BUY</div></div>
+    <div class="vol-card"><div class="label">Vol Signal</div>   <div class="value" id="v-signal" style="font-size:13px; margin-top:6px;">–</div><div class="sub" id="v-signal-sub">–</div></div>
+  </div>
+
+  <div class="charts">
+    <div class="chart-box">
+      <h3>Implied Volatility vs India VIX (last 60 scans)</h3>
+      <canvas id="chart-iv" style="max-height:220px;"></canvas>
+    </div>
+    <div class="chart-box">
+      <h3>IV–VIX Spread (last 60 scans)</h3>
+      <canvas id="chart-ivspread"></canvas>
+    </div>
+  </div>
+
+  <!-- Current straddle metrics -->
+  <div class="signal-box">
+    <h2>ATM Straddle Metrics</h2>
+    <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap:12px; margin-top:8px; font-size:12px;">
+      <div><span style="color:#8b949e">Straddle Premium:</span> <b id="v-prem" class="warn">–</b></div>
+      <div><span style="color:#8b949e">Cost (1 lot):</span>     <b id="v-cost">–</b></div>
+      <div><span style="color:#8b949e">Breakeven Upper:</span>  <b id="v-be-up" class="up">–</b></div>
+      <div><span style="color:#8b949e">Breakeven Lower:</span>  <b id="v-be-dn" class="down">–</b></div>
+      <div><span style="color:#8b949e">Move Required:</span>    <b id="v-move" class="warn">–</b></div>
+      <div><span style="color:#8b949e">Est. Capital:</span>     <b id="v-capital">–</b></div>
+    </div>
+  </div>
+
+  <!-- IV thresholds legend -->
+  <div class="signal-box" style="margin-top:12px;">
+    <h2>IV Signal Rules</h2>
+    <div style="font-size:12px; line-height:2.2; color:#c9d1d9;">
+      <div><b class="down">IV – VIX &gt; +4</b> &nbsp;→&nbsp; Options are <b>OVERPRICED</b> → <span class="sig-pill sig-sell" style="display:inline">📉 SELL STRADDLE</span> (collect decaying premium)</div>
+      <div><b class="up">IV – VIX &lt; -3</b> &nbsp;→&nbsp; Options are <b>CHEAP</b> → <span class="sig-pill sig-buy" style="display:inline">💥 BUY STRADDLE</span> (profit from big move either way)</div>
+      <div><b style="color:#bc8cff">VIX ≥ 25</b> &nbsp;→&nbsp; Tail-risk spike → <span class="sig-pill" style="display:inline; background:#bc8cff22; color:#bc8cff; border:1px solid #bc8cff55;">🌪️ BUY STRANGLE</span> (OTM ±200 pts, cheaper protection)</div>
+      <div><b style="color:#8b949e">Otherwise</b> &nbsp;→&nbsp; Options fairly priced → No volatility edge</div>
+    </div>
+  </div>
+
+  <div style="display:flex; justify-content:flex-end; margin-top:10px;">
+    <button class="btn btn-secondary btn-sm" onclick="loadVolatility()">↻ Refresh</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════ POSITIONS ══════════════════════════ -->
+<div class="panel" id="tab-positions">
+  <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
+    <span style="color:#8b949e; font-size:12px" id="pos-summary">Loading…</span>
+    <button class="btn btn-secondary btn-sm" onclick="loadPositions()">↻ Refresh</button>
+  </div>
+  <div id="pos-list">
+    <div style="color:#484f58; text-align:center; padding:48px;">No open positions</div>
+  </div>
+</div>
+
+<!-- ══════════════════════════ ORDERS ══════════════════════════ -->
+<div class="panel" id="tab-orders">
+  <div class="ctrl-grid" style="margin-bottom:20px;">
+
+    <!-- Butterfly order -->
+    <div class="ctrl-box">
+      <h3>Place Butterfly Spread</h3>
+      <div class="form-grid" style="margin-bottom:12px;">
+        <div class="form-group">
+          <label>Direction</label>
+          <select id="o-direction">
+            <option value="SELL_BUTTERFLY">SELL Butterfly (Z &gt; +2)</option>
+            <option value="BUY_BUTTERFLY">BUY Butterfly (Z &lt; -2)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Qty / Leg</label>
+          <input type="number" id="o-qty" value="75" min="1" />
+        </div>
+      </div>
+      <div class="form-grid" style="margin-bottom:12px;">
+        <div class="form-group"><label>Near Symbol</label><input type="text" id="o-near" placeholder="NIFTYJUN25FUT" /></div>
+        <div class="form-group"><label>Next Symbol</label><input type="text" id="o-next" placeholder="NIFTYJUL25FUT" /></div>
+        <div class="form-group"><label>Far Symbol</label> <input type="text" id="o-far"  placeholder="NIFTYAUG25FUT" /></div>
+      </div>
+      <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+        <div class="form-group" style="flex:1; min-width:130px;">
+          <label>Product</label>
+          <select id="o-product">
+            <option value="CARRYFORWARD">NRML (CARRYFORWARD)</option>
+            <option value="INTRADAY">MIS (INTRADAY)</option>
+          </select>
+        </div>
+        <button class="btn btn-primary" style="margin-top:18px;" onclick="placeButterfly()">
+          Place Butterfly
+        </button>
+      </div>
+    </div>
+
+    <!-- Single order -->
+    <div class="ctrl-box">
+      <h3>Custom Single Order</h3>
+      <div class="form-grid" style="margin-bottom:12px;">
+        <div class="form-group"><label>Symbol</label>
+          <input type="text" id="c-symbol" placeholder="NIFTYJUN25FUT" /></div>
+        <div class="form-group"><label>Exchange</label>
+          <select id="c-exchange">
+            <option value="NFO">NFO</option>
+            <option value="NSE">NSE</option>
+            <option value="BSE">BSE</option>
+          </select></div>
+        <div class="form-group"><label>Side</label>
+          <select id="c-side">
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+          </select></div>
+        <div class="form-group"><label>Quantity</label>
+          <input type="number" id="c-qty" value="75" min="1" /></div>
+        <div class="form-group"><label>Order Type</label>
+          <select id="c-otype" onchange="togglePriceField(this)">
+            <option value="MARKET">MARKET</option>
+            <option value="LIMIT">LIMIT</option>
+          </select></div>
+        <div class="form-group" id="c-price-group" style="display:none;"><label>Price</label>
+          <input type="number" id="c-price" value="0" step="0.05" /></div>
+        <div class="form-group"><label>Product</label>
+          <select id="c-product">
+            <option value="CARRYFORWARD">NRML</option>
+            <option value="INTRADAY">MIS</option>
+          </select></div>
+      </div>
+      <button class="btn btn-warn" onclick="placeCustomOrder()">Place Order</button>
+    </div>
+  </div>
+
+  <div class="section-head" style="margin-top:0;">
+    Order History
+    <button class="btn btn-secondary btn-sm" style="float:right; margin-top:-2px"
+            onclick="loadOrders()">↻ Refresh</button>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Time</th><th>Symbol</th><th>Exch</th><th>Side</th>
+        <th>Qty</th><th>Type</th><th>Price</th><th>Product</th>
+        <th>Tag</th><th>Order ID</th><th>Status</th>
+      </tr></thead>
+      <tbody id="orders-body">
+        <tr><td colspan="11" style="text-align:center; color:#484f58; padding:32px;">No orders yet</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ══════════════════════════ CONTROLS ══════════════════════════ -->
+<div class="panel" id="tab-controls">
+  <div class="ctrl-grid">
+
+    <!-- Mode & SNS -->
+    <div class="ctrl-box">
+      <h3>Mode &amp; Execution</h3>
+      <div class="form-group" style="margin-bottom:14px;">
+        <label>Broker</label>
+        <select id="cfg-broker">
+          <option value="angel">Angel One (SmartAPI)</option>
+          <option value="zerodha">Zerodha (Kite Connect)</option>
+        </select>
+      </div>
+      <div style="margin-bottom:14px;">
+        <div style="font-size:11px; color:#8b949e; text-transform:uppercase; letter-spacing:.5px; margin-bottom:8px;">Trading Mode</div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn btn-secondary" id="btn-paper" onclick="setMode('PAPER')">Paper</button>
+          <button class="btn btn-danger"    id="btn-live"  onclick="setMode('LIVE')">Live</button>
+        </div>
+        <div style="font-size:11px; color:#484f58; margin-top:6px;" id="mode-note">Current: PAPER</div>
+      </div>
+      <div>
+        <div style="font-size:11px; color:#8b949e; text-transform:uppercase; letter-spacing:.5px; margin-bottom:8px;">Auto-Execute via SNS</div>
+        <label class="toggle-wrap">
+          <span class="toggle">
+            <input type="checkbox" id="cfg-sns" onchange="saveConfig()">
+            <span class="toggle-slider"></span>
+          </span>
+          <span id="sns-label" style="font-size:12px; color:#8b949e;">Disabled</span>
+        </label>
+        <div style="font-size:11px; color:#484f58; margin-top:6px;">
+          When enabled, the executor Lambda fires automatically on strong signals.
+        </div>
+      </div>
+    </div>
+
+    <!-- Risk limits -->
+    <div class="ctrl-box">
+      <h3>Risk Limits</h3>
+      <div class="form-grid" style="margin-bottom:14px;">
+        <div class="form-group">
+          <label>Max Daily Loss (₹)</label>
+          <input type="number" id="cfg-maxloss" value="5000" min="0" />
+        </div>
+        <div class="form-group">
+          <label>Max Open Positions</label>
+          <input type="number" id="cfg-maxpos" value="3" min="1" max="10" />
+        </div>
+        <div class="form-group">
+          <label>Min Signal Strength</label>
+          <input type="number" id="cfg-minstr" value="2.5" min="0" max="5" step="0.5" />
+        </div>
+      </div>
+      <button class="btn btn-primary" onclick="saveConfig()">Save Risk Settings</button>
+    </div>
+
+    <!-- Signal params -->
+    <div class="ctrl-box">
+      <h3>Signal Parameters</h3>
+      <div class="form-grid" style="margin-bottom:14px;">
+        <div class="form-group">
+          <label>Z-Score Entry</label>
+          <input type="number" id="cfg-zentry"   value="2.0"  step="0.1" />
+        </div>
+        <div class="form-group">
+          <label>Z-Score Exit</label>
+          <input type="number" id="cfg-zexit"    value="0.5"  step="0.1" />
+        </div>
+        <div class="form-group">
+          <label>Lookback Window</label>
+          <input type="number" id="cfg-lookback" value="50"   min="10" />
+        </div>
+        <div class="form-group">
+          <label>Arb Threshold (pts)</label>
+          <input type="number" id="cfg-arb"      value="15"   min="5" />
+        </div>
+      </div>
+      <button class="btn btn-primary" onclick="saveConfig()">Save Signal Settings</button>
+    </div>
+
+    <!-- Event calendar -->
+    <div class="ctrl-box">
+      <h3>Event Calendar (Trading Blocked)</h3>
+      <div style="font-size:11px; color:#8b949e; margin-bottom:10px; line-height:1.7;">
+        Dates listed here will <b style="color:#f85149">block all new positions</b>.
+        Use for election results, RBI policy, budget day, geopolitical events.<br>
+        Format: <code style="color:#58a6ff">YYYY-MM-DD</code>, one per line.
+      </div>
+      <div class="form-group">
+        <label>Blocked Dates</label>
+        <textarea id="cfg-events"
+          style="background:#21262d; border:1px solid #30363d; border-radius:6px;
+                 color:#c9d1d9; padding:8px 10px; font-size:12px; font-family:monospace;
+                 width:100%; min-height:110px; resize:vertical;"
+          placeholder="2025-06-04&#10;2025-07-25&#10;2025-02-01"></textarea>
+      </div>
+      <div style="display:flex; gap:8px; margin-top:10px; align-items:center; flex-wrap:wrap;">
+        <button class="btn btn-primary" onclick="saveEventDates()">Save Dates</button>
+        <button class="btn btn-secondary btn-sm" onclick="addKnownEvents()">+ Add 2025 events</button>
+      </div>
+      <div style="font-size:11px; color:#484f58; margin-top:8px;" id="event-note"></div>
+    </div>
+
+    <!-- NSE Holidays -->
+    <div class="ctrl-box">
+      <h3>NSE Holidays (Scanner Skips)</h3>
+      <div style="font-size:11px; color:#8b949e; margin-bottom:10px; line-height:1.7;">
+        The scanner <b style="color:#f85149">will not run</b> on these dates (exchange closed).<br>
+        Format: <code style="color:#58a6ff">YYYY-MM-DD</code>, one per line.
+        <br>Weekends are always skipped automatically.
+      </div>
+      <div class="form-group">
+        <label>Holiday Dates</label>
+        <textarea id="cfg-holidays"
+          style="background:#21262d; border:1px solid #30363d; border-radius:6px;
+                 color:#c9d1d9; padding:8px 10px; font-size:12px; font-family:monospace;
+                 width:100%; min-height:130px; resize:vertical;"
+          placeholder="2025-08-15&#10;2025-10-02&#10;2025-10-24"></textarea>
+      </div>
+      <div style="display:flex; gap:8px; margin-top:10px; align-items:center; flex-wrap:wrap;">
+        <button class="btn btn-primary"   onclick="saveHolidays()">Save Holidays</button>
+        <button class="btn btn-secondary btn-sm" onclick="addNseHolidays2025()">+ 2025 holidays</button>
+        <button class="btn btn-secondary btn-sm" onclick="addNseHolidays2026()">+ 2026 holidays</button>
+      </div>
+      <div style="font-size:11px; color:#484f58; margin-top:8px;" id="holiday-note"></div>
+    </div>
+
+    <!-- Telegram Alerts Guide -->
+    <div class="ctrl-box">
+      <h3>📱 Telegram Alerts</h3>
+      <div style="font-size:12px; color:#8b949e; line-height:1.9; margin-bottom:14px;">
+        The bot sends you Telegram messages for every important event — you don't need to keep
+        the dashboard open. Here's what each alert means:
+      </div>
+
+      <div style="display:grid; gap:10px;">
+        <!-- Signal alert -->
+        <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px;">
+          <div style="font-size:13px; font-weight:600; color:#58a6ff; margin-bottom:6px;">
+            📊 / 🦋 / ⚡ — New Signal Detected
+          </div>
+          <div style="font-size:11px; color:#8b949e; line-height:1.8;">
+            Sent every scan when a strong signal fires.<br>
+            Shows: strategy, Z-score, strength, S/L, target, regime.<br>
+            <b style="color:#f0f6fc;">Action:</b> Review signal, then check the Daily Plan tab.
+            Auto-execute fires automatically if enabled.
+          </div>
+        </div>
+
+        <!-- Order placed -->
+        <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px;">
+          <div style="font-size:13px; font-weight:600; color:#3fb950; margin-bottom:6px;">
+            ✅ ORDER PLACED — New Position Opened
+          </div>
+          <div style="font-size:11px; color:#8b949e; line-height:1.8;">
+            Sent by executor Lambda when a trade is placed.<br>
+            Shows: trade type, qty/leg, entry curve diff, SL, target.<br>
+            <b style="color:#f0f6fc;">Action:</b> No action needed. Monitor via Positions tab.
+          </div>
+        </div>
+
+        <!-- Position closed -->
+        <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px;">
+          <div style="font-size:13px; font-weight:600; color:#f0f6fc; margin-bottom:6px;">
+            🏁 TARGET_HIT &nbsp;|&nbsp; 🛑 STOP_LOSS &nbsp;|&nbsp; ⚠️ EXPIRY_RISK — Position Closed
+          </div>
+          <div style="font-size:11px; color:#8b949e; line-height:1.8;">
+            Sent when position_monitor closes a trade.<br>
+            Shows: P&amp;L (approx), reason, symbols.<br>
+            <b style="color:#f0f6fc;">Action:</b> For STOP_LOSS, review strategy params in Controls tab.
+          </div>
+        </div>
+
+        <!-- Regime halt -->
+        <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px;">
+          <div style="font-size:13px; font-weight:600; color:#f85149; margin-bottom:6px;">
+            🛑 SPREAD TRADING HALTED — Regime Alert
+          </div>
+          <div style="font-size:11px; color:#8b949e; line-height:1.8;">
+            Sent when VIX &gt; 25, large gap, or event risk detected.<br>
+            No new positions opened. Existing positions monitored.<br>
+            <b style="color:#f0f6fc;">Action:</b> Wait for OK/SAFE state before resuming.
+          </div>
+        </div>
+
+        <!-- Token refresh -->
+        <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px;">
+          <div style="font-size:13px; font-weight:600; color:#58a6ff; margin-bottom:6px;">
+            ✅ Token Refreshed — 8:30 AM daily
+          </div>
+          <div style="font-size:11px; color:#8b949e; line-height:1.8;">
+            Angel One JWT is renewed each morning before market open.<br>
+            <b style="color:#f85149;">🚨 If you see "Token Refresh FAILED"</b> — scanner won't authenticate.
+            Check Secrets Manager credentials immediately.
+          </div>
+        </div>
+
+        <!-- CloudWatch alarm -->
+        <div style="background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px;">
+          <div style="font-size:13px; font-weight:600; color:#d29922; margin-bottom:6px;">
+            🚨 ALARM TRIGGERED — Lambda Error
+          </div>
+          <div style="font-size:11px; color:#8b949e; line-height:1.8;">
+            Sent by CloudWatch when any Lambda has repeated errors.<br>
+            Shows: alarm name, reason, state change.<br>
+            <b style="color:#f0f6fc;">Action:</b> Check AWS CloudWatch Logs for the named function.
+          </div>
+        </div>
+      </div>
+
+      <div style="margin-top:14px; padding:10px 12px; background:#0d1117;
+                  border:1px solid #30363d; border-radius:6px; font-size:11px; color:#8b949e;">
+        <b style="color:#f0f6fc;">Setup:</b> To enable alerts, set <code style="color:#58a6ff;">TELEGRAM_BOT_TOKEN</code>
+        and <code style="color:#58a6ff;">TELEGRAM_CHAT_ID</code> in <code>deploy/.env</code>
+        before running <code>deploy_lambda.sh</code>.<br><br>
+        <b style="color:#f0f6fc;">Get your Chat ID:</b>
+        Message <code>@userinfobot</code> on Telegram — it will reply with your numeric chat ID.
+      </div>
+    </div>
+
+    <!-- Auth status -->
+    <div class="ctrl-box">
+      <h3>Broker Auth Status</h3>
+      <div id="auth-status-detail" style="color:#484f58; font-size:12px; line-height:1.9;">
+        Click below to test broker connectivity.
+      </div>
+      <button class="btn btn-secondary" style="margin-top:14px;" onclick="checkAuth()">
+        Check Connection
+      </button>
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════ P&L ══════════════════════════ -->
+<div class="panel" id="tab-pnl">
+  <div class="grid" style="max-width:480px; margin-bottom:20px;">
+    <div class="card">
+      <div class="label">Today's P&amp;L</div>
+      <div class="value" id="pnl-today">–</div>
+      <div class="sub"   id="pnl-trades">– trades</div>
+    </div>
+    <div class="card">
+      <div class="label">Open Positions</div>
+      <div class="value" id="pnl-open-count">–</div>
+      <div class="sub">unrealised exposure</div>
+    </div>
+  </div>
+
+  <div class="chart-box" style="margin-bottom:20px;">
+    <h3>Daily P&amp;L – last 30 days</h3>
+    <canvas id="chart-pnl" style="max-height:240px;"></canvas>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>Date</th><th>Realised P&amp;L</th><th>Trades</th><th>Mode</th>
+      </tr></thead>
+      <tbody id="pnl-history">
+        <tr><td colspan="4" style="text-align:center; color:#484f58; padding:32px;">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div id="toast"></div>
+<footer>NIFTY Spread Bot Control Panel &nbsp;|&nbsp; Angel One SmartAPI</footer>
+
+<script>
+// ─────────────────────────────────────────────────────────
+//  Config
+// ─────────────────────────────────────────────────────────
+const API_BASE = window.API_GATEWAY_URL || "https://dyqeo9m3mk.execute-api.ap-south-1.amazonaws.com";
+const REFRESH  = 5000;
+
+// ─────────────────────────────────────────────────────────
+//  Tab switching
+// ─────────────────────────────────────────────────────────
+let activeTab = 'dailyplan';
+const TAB_ORDER = ['dailyplan','scanner','volatility','positions','orders','controls','pnl'];
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.tab === name)
+  );
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  activeTab = name;
+  if (name === 'dailyplan')  loadDailyPlan();
+  if (name === 'volatility') loadVolatility();
+  if (name === 'positions')  loadPositions();
+  if (name === 'orders')     loadOrders();
+  if (name === 'controls')   loadConfig();
+  if (name === 'pnl')        loadPnl();
+}
+
+// ─────────────────────────────────────────────────────────
+//  Toast
+// ─────────────────────────────────────────────────────────
+let _toastTimer;
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className   = 'show ' + type;
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+// ─────────────────────────────────────────────────────────
+//  Charts
+// ─────────────────────────────────────────────────────────
+function mkChart(id, label, color, type = 'line') {
+  return new Chart(document.getElementById(id), {
+    type,
+    data: { labels: [], datasets: [{ label, data: [],
+      borderColor: color, backgroundColor: color + '22',
+      borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: true }] },
+    options: { animation: false, scales: {
+      x: { ticks: { color:'#484f58', maxTicksLimit:8 }, grid: { color:'#21262d' } },
+      y: { ticks: { color:'#484f58' },                   grid: { color:'#21262d' } }
+    }, plugins: { legend: { display: false } } }
+  });
+}
+
+const cdiffChart    = mkChart('chart-cdiff',    'Curve Diff', '#58a6ff');
+const zscoreChart   = mkChart('chart-zscore',   'Z-Score',    '#e3b341');
+const pnlChart      = mkChart('chart-pnl',      'Daily P&L',  '#3fb950', 'bar');
+const ivSpreadChart = mkChart('chart-ivspread',  'IV–VIX Spread', '#e3b341');
+
+// Dual-series IV vs VIX chart
+const ivChart = new Chart(document.getElementById('chart-iv'), {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      { label: 'Avg IV %', data: [], borderColor: '#bc8cff', backgroundColor: '#bc8cff11',
+        borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: false },
+      { label: 'India VIX', data: [], borderColor: '#e3b341', backgroundColor: '#e3b34111',
+        borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill: false },
+    ]
+  },
+  options: {
+    animation: false,
+    scales: {
+      x: { ticks: { color:'#484f58', maxTicksLimit:8 }, grid: { color:'#21262d' } },
+      y: { ticks: { color:'#484f58' },                   grid: { color:'#21262d' } }
+    },
+    plugins: { legend: { display: true, labels: { color: '#8b949e', font: { size: 11 } } } }
+  }
+});
+
+function updateChart(chart, labels, data, limit = 60) {
+  chart.data.labels = labels.slice(-limit);
+  chart.data.datasets[0].data = data.slice(-limit);
+  chart.update('none');
+}
+
+// ─────────────────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────────────────
+const fmtTime = ts => ts ? ts.slice(11, 19) : '–';
+
+function setSigPill(el, text, type) {
+  el.textContent = text;
+  el.className   = 'sig-pill sig-' + type;
+}
+
+function togglePriceField(sel) {
+  document.getElementById('c-price-group').style.display =
+    sel.value === 'LIMIT' ? 'block' : 'none';
+}
+
+// ─────────────────────────────────────────────────────────
+//  SCANNER tab
+// ─────────────────────────────────────────────────────────
+let _latestSignal = null;
+
+async function refreshScanner() {
+  try {
+    const r = await fetch(`${API_BASE}/signals?limit=60`);
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!data.length) return;
+
+    const L = data[0];
+    _latestSignal = L;
+
+    document.getElementById('m-near').textContent     = L.near_price  || '–';
+    document.getElementById('m-near-sym').textContent  = L.near_symbol || '';
+    document.getElementById('m-next').textContent     = L.next_price  || '–';
+    document.getElementById('m-next-sym').textContent  = L.next_symbol || '';
+    document.getElementById('m-far').textContent      = L.far_price   || '–';
+    document.getElementById('m-far-sym').textContent   = L.far_symbol  || '';
+    document.getElementById('m-s1').textContent       = L.spread1     || '–';
+    document.getElementById('m-s2').textContent       = L.spread2     || '–';
+
+    const cdEl = document.getElementById('m-cd');
+    cdEl.textContent = L.curve_diff || '–';
+    cdEl.className = 'value ' + (parseFloat(L.curve_diff) > 0 ? 'warn' : 'up');
+
+    const zsEl = document.getElementById('m-zs');
+    zsEl.textContent = parseFloat(L.zscore || 0).toFixed(2);
+    zsEl.className = 'value ' + (Math.abs(parseFloat(L.zscore || 0)) > 2 ? 'warn' : '');
+
+    document.getElementById('m-dte').textContent   = (L.days_to_expiry || '–') + 'd';
+    document.getElementById('m-bias').textContent  = L.expiry_bias || '';
+
+    // VIX & Regime
+    const vix   = parseFloat(L.india_vix || 0);
+    const vixEl = document.getElementById('m-vix');
+    vixEl.textContent = vix > 0 ? vix.toFixed(1) : '–';
+    vixEl.className   = 'value ' + (vix >= 25 ? 'down' : vix >= 18 ? 'warn' : vix > 0 ? 'up' : '');
+    document.getElementById('m-vix-level').textContent = L.vix_level || '–';
+
+    const regime    = L.regime || 'SAFE';
+    const regimeEl  = document.getElementById('m-regime');
+    const regimeSub = document.getElementById('m-regime-sub');
+    const dot       = document.getElementById('status-dot');
+    const regimeMap = { SAFE: ['✅ SAFE', 'up', ''], CAUTION: ['⚠️ CAUTION', 'warn', 'caution'], HALT: ['🛑 HALT', 'down', 'halt'] };
+    const [rLabel, rClass, dotClass] = regimeMap[regime] || regimeMap['SAFE'];
+    regimeEl.textContent = rLabel;
+    regimeEl.className   = 'value ' + rClass;
+    regimeSub.textContent = regime === 'SAFE' ? (L.optimal_window === 'True' ? '✅ Optimal DTE window' : 'OK to trade') : 'Trading restricted';
+    dot.className = dotClass;
+
+    // Regime banner
+    const banner     = document.getElementById('regime-banner');
+    const bannerTitle = document.getElementById('regime-banner-title');
+    const bannerBody  = document.getElementById('regime-banner-body');
+    const reasons    = (L.block_reasons || '').trim();
+    const warnings   = (L.regime_warnings || '').trim();
+
+    if (regime === 'HALT' && reasons) {
+      banner.style.display = 'block';
+      banner.className = 'regime-banner halt';
+      bannerTitle.textContent = '🛑 Trading HALTED – No new positions will be opened';
+      bannerBody.innerHTML = reasons.split(' | ').map(r =>
+        `<div style="margin-top:4px; padding-left:8px; border-left:2px solid #f8514966;">${r}</div>`
+      ).join('');
+    } else if (regime === 'CAUTION' && warnings) {
+      banner.style.display = 'block';
+      banner.className = 'regime-banner caution';
+      bannerTitle.textContent = '⚠️ Caution – Position size reduced to 50%';
+      bannerBody.innerHTML = warnings.split(' | ').map(w =>
+        `<div style="margin-top:4px; padding-left:8px; border-left:2px solid #e3b34166;">${w}</div>`
+      ).join('');
+    } else {
+      banner.style.display = 'none';
+    }
+
+    const ss = L.spread_signal || 'NONE';
+    if (ss.includes('SELL'))     setSigPill(document.getElementById('sig-spread'), '🦋 ' + ss, 'sell');
+    else if (ss.includes('BUY')) setSigPill(document.getElementById('sig-spread'), '🦋 ' + ss, 'buy');
+    else                         setSigPill(document.getElementById('sig-spread'), 'NO SPREAD SIGNAL', 'none');
+
+    const as = L.arbitrage_signal || 'NONE';
+    setSigPill(document.getElementById('sig-arb'),
+      as !== 'NONE' ? '⚡ ' + as : 'NO ARB SIGNAL',
+      as !== 'NONE' ? 'arb' : 'none');
+
+    document.getElementById('sig-strength').textContent = L.signal_strength || '–';
+    document.getElementById('sig-qty').textContent      = L.recommended_qty || '–';
+    document.getElementById('sig-sl').textContent       = L.stoploss_diff   || '–';
+    document.getElementById('sig-tgt').textContent      = L.target_diff     || '–';
+    document.getElementById('last-updated').textContent = 'Updated ' + fmtTime(L.timestamp);
+
+    const rev   = [...data].reverse();
+    const times = rev.map(r => fmtTime(r.timestamp));
+    updateChart(cdiffChart,  times, rev.map(r => parseFloat(r.curve_diff || 0)));
+    updateChart(zscoreChart, times, rev.map(r => parseFloat(r.zscore     || 0)));
+
+    document.getElementById('tbl-body').innerHTML = data.map(row => {
+      const sig = row.spread_signal || 'NONE';
+      const arb = row.arbitrage_signal || 'NONE';
+      const sigCl = sig.includes('SELL') ? 'down' : sig.includes('BUY') ? 'up' : '';
+      const arbCl = arb !== 'NONE' ? 'warn' : '';
+      const z = parseFloat(row.zscore || 0);
+      return `<tr>
+        <td>${fmtTime(row.timestamp)}</td>
+        <td>${row.near_price||''}</td><td>${row.next_price||''}</td><td>${row.far_price||''}</td>
+        <td>${row.spread1||''}</td><td>${row.spread2||''}</td>
+        <td class="${parseFloat(row.curve_diff||0)>0?'warn':'up'}">${row.curve_diff||''}</td>
+        <td class="${Math.abs(z)>2?'warn':''}">${z.toFixed(2)}</td>
+        <td>${row.rollover_signal||''}</td><td>${row.volume_signal||''}</td>
+        <td class="${sigCl}">${sig}</td>
+        <td>${row.signal_strength||''}</td><td>${row.recommended_qty||''}</td>
+        <td class="down">${row.stoploss_diff||''}</td>
+        <td class="up">${row.target_diff||''}</td>
+        <td class="${arbCl}">${arb}</td>
+        <td class="${arbCl}">${row.arb_mispricing||''}</td>
+        <td class="${parseFloat(row.india_vix||0)>=25?'down':parseFloat(row.india_vix||0)>=18?'warn':'up'}">${row.india_vix||''}</td>
+        <td class="${row.regime==='HALT'?'down':row.regime==='CAUTION'?'warn':'up'}">${row.regime||''}</td>
+      </tr>`;
+    }).join('');
+
+  } catch(e) { console.error('Scanner error:', e); }
+}
+
+function preloadSignalToOrder() {
+  if (_latestSignal) {
+    document.getElementById('o-near').value = _latestSignal.near_symbol    || '';
+    document.getElementById('o-next').value = _latestSignal.next_symbol    || '';
+    document.getElementById('o-far').value  = _latestSignal.far_symbol     || '';
+    document.getElementById('o-qty').value  = _latestSignal.recommended_qty || 75;
+    const sig = _latestSignal.spread_signal || 'NONE';
+    if (sig !== 'NONE') document.getElementById('o-direction').value = sig;
+  }
+  switchTab('orders');
+}
+
+// ─────────────────────────────────────────────────────────
+//  POSITIONS tab
+// ─────────────────────────────────────────────────────────
+async function loadPositions() {
+  try {
+    const r    = await fetch(`${API_BASE}/positions`);
+    const data = await r.json();
+
+    document.getElementById('pnl-open-count').textContent = data.length;
+    const badge   = document.getElementById('pos-count-badge');
+    const summary = document.getElementById('pos-summary');
+
+    if (!data.length) {
+      document.getElementById('pos-list').innerHTML =
+        '<div style="color:#484f58; text-align:center; padding:48px;">No open positions</div>';
+      badge.style.display = 'none';
+      summary.textContent = '0 open positions';
+      return;
+    }
+
+    badge.style.display = 'inline';
+    badge.textContent   = data.length;
+    summary.textContent = `${data.length} open position${data.length > 1 ? 's' : ''}`;
+
+    document.getElementById('pos-list').innerHTML = data.map(p => `
+      <div class="pos-card">
+        <div class="pos-head">
+          <span style="font-size:13px; font-weight:600; color:#e6edf3">${p.trade_type || '–'}</span>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span style="font-size:11px; color:#484f58">${fmtTime(p.timestamp)}</span>
+            <span class="badge ${(p.mode||'PAPER')==='LIVE'?'badge-live':'badge-paper'}">${p.mode||'PAPER'}</span>
+            <button class="btn btn-danger btn-sm"
+              onclick="closePosition('${p.position_id}', '${p.trade_type}')">Close</button>
+          </div>
+        </div>
+        <div class="pos-body">
+          <div class="pos-field"><div class="fl">Near</div>        <div class="fv">${p.near_symbol||'–'}</div></div>
+          <div class="pos-field"><div class="fl">Next</div>        <div class="fv">${p.next_symbol||'–'}</div></div>
+          <div class="pos-field"><div class="fl">Far</div>         <div class="fv">${p.far_symbol||'–'}</div></div>
+          <div class="pos-field"><div class="fl">Qty / Leg</div>   <div class="fv">${p.qty||'–'}</div></div>
+          <div class="pos-field"><div class="fl">Entry Diff</div>  <div class="fv warn">${p.entry_curve_diff||'–'}</div></div>
+          <div class="pos-field"><div class="fl">Stop Loss</div>   <div class="fv down">${p.stoploss_diff||'–'}</div></div>
+          <div class="pos-field"><div class="fl">Target</div>      <div class="fv up">${p.target_diff||'–'}</div></div>
+        </div>
+      </div>`).join('');
+
+  } catch(e) { toast('Failed to load positions', 'error'); }
+}
+
+async function closePosition(positionId, tradeType) {
+  if (!confirm(`Close position: ${tradeType}?\n\nThis will place reverse orders to close all legs.`)) return;
+  try {
+    const r = await fetch(`${API_BASE}/positions/close`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ position_id: positionId }),
+    });
+    const d = await r.json();
+    if (r.ok) {
+      toast(`Position closed – ${d.order_count || ''} orders placed`, 'success');
+      loadPositions();
+      loadOrders();
+    } else {
+      toast(d.error || 'Close failed', 'error');
+    }
+  } catch(e) { toast('Close failed: ' + e.message, 'error'); }
+}
+
+// ─────────────────────────────────────────────────────────
+//  ORDERS tab
+// ─────────────────────────────────────────────────────────
+async function loadOrders() {
+  try {
+    const r    = await fetch(`${API_BASE}/orders?limit=50`);
+    const data = await r.json();
+    const tbody = document.getElementById('orders-body');
+    if (!data.length) {
+      tbody.innerHTML = '<tr><td colspan="11" style="text-align:center; color:#484f58; padding:32px;">No orders yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map(o => `<tr>
+      <td>${fmtTime(o.timestamp)}</td>
+      <td>${o.tradingsymbol||'–'}</td>
+      <td>${o.exchange||'–'}</td>
+      <td class="${o.transaction_type==='BUY'?'up':'down'}">${o.transaction_type||'–'}</td>
+      <td>${o.quantity||'–'}</td>
+      <td>${o.order_type||'–'}</td>
+      <td>${o.price||'0'}</td>
+      <td>${o.product||'–'}</td>
+      <td style="color:#484f58">${o.tag||''}</td>
+      <td style="color:#484f58; font-size:11px;">${(o.order_id||'').slice(-10)}</td>
+      <td class="${o.status==='PLACED'?'up':o.status==='FAILED'?'down':'warn'}">${o.status||'–'}</td>
+    </tr>`).join('');
+  } catch(e) { console.error('Orders load error:', e); }
+}
+
+async function placeButterfly() {
+  const direction = document.getElementById('o-direction').value;
+  const qty       = parseInt(document.getElementById('o-qty').value);
+  const near      = document.getElementById('o-near').value.trim().toUpperCase();
+  const next      = document.getElementById('o-next').value.trim().toUpperCase();
+  const far       = document.getElementById('o-far').value.trim().toUpperCase();
+  const product   = document.getElementById('o-product').value;
+
+  if (!near || !next || !far) { toast('Fill in all three symbols', 'error'); return; }
+  if (!confirm(
+    `Place ${direction}?\n` +
+    `Near: ${near}  (1 leg × ${qty})\n` +
+    `Next: ${next}  (2 legs × ${qty*2})\n` +
+    `Far:  ${far}   (1 leg × ${qty})\n\n` +
+    `Product: ${product}`
+  )) return;
+
+  try {
+    const r = await fetch(`${API_BASE}/orders`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ type: 'BUTTERFLY', direction,
+                                near_symbol: near, next_symbol: next, far_symbol: far,
+                                qty_per_leg: qty, product }),
+    });
+    const d = await r.json();
+    if (r.ok) { toast(`Butterfly placed – ${d.order_count} legs`, 'success'); loadOrders(); }
+    else      { toast(d.error || 'Order failed', 'error'); }
+  } catch(e) { toast('Order failed: ' + e.message, 'error'); }
+}
+
+async function placeCustomOrder() {
+  const symbol   = document.getElementById('c-symbol').value.trim().toUpperCase();
+  const exchange = document.getElementById('c-exchange').value;
+  const side     = document.getElementById('c-side').value;
+  const qty      = parseInt(document.getElementById('c-qty').value);
+  const otype    = document.getElementById('c-otype').value;
+  const price    = parseFloat(document.getElementById('c-price').value) || 0;
+  const product  = document.getElementById('c-product').value;
+
+  if (!symbol) { toast('Enter a symbol', 'error'); return; }
+  if (!confirm(`${side} ${qty} × ${symbol} @ ${otype}${otype==='LIMIT'?' ₹'+price:''}\n${exchange} / ${product}`)) return;
+
+  try {
+    const r = await fetch(`${API_BASE}/orders`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ type: 'SINGLE', tradingsymbol: symbol, exchange,
+                                transaction_type: side, quantity: qty, order_type: otype,
+                                price, product, tag: 'MANUAL' }),
+    });
+    const d = await r.json();
+    if (r.ok) { toast(`Order placed: ${d.order_id || 'OK'}`, 'success'); loadOrders(); }
+    else      { toast(d.error || 'Order failed', 'error'); }
+  } catch(e) { toast('Order failed: ' + e.message, 'error'); }
+}
+
+// ─────────────────────────────────────────────────────────
+//  CONTROLS tab
+// ─────────────────────────────────────────────────────────
+async function loadConfig() {
+  try {
+    const r   = await fetch(`${API_BASE}/config`);
+    const cfg = await r.json();
+
+    const mode = cfg.MODE || 'PAPER';
+    document.getElementById('mode-note').textContent       = `Current: ${mode}`;
+    document.getElementById('mode-badge').textContent      = mode;
+    document.getElementById('mode-badge').className        = `badge badge-${mode.toLowerCase()}`;
+
+    document.getElementById('cfg-maxloss').value  = cfg.MAX_DAILY_LOSS       || 5000;
+    document.getElementById('cfg-maxpos').value   = cfg.MAX_POSITIONS        || 3;
+    document.getElementById('cfg-minstr').value   = cfg.MIN_SIGNAL_STRENGTH  || 2.5;
+    document.getElementById('cfg-zentry').value   = cfg.ZSCORE_THRESHOLD     || 2.0;
+    document.getElementById('cfg-zexit').value    = cfg.ZSCORE_EXIT          || 0.5;
+    document.getElementById('cfg-lookback').value = cfg.LOOKBACK_WINDOW      || 50;
+    document.getElementById('cfg-arb').value      = cfg.ARBITRAGE_THRESHOLD  || 15;
+    if (cfg.BROKER) document.getElementById('cfg-broker').value = cfg.BROKER;
+
+    // Event calendar
+    const eventDates = (cfg.EVENT_DATES || '').split(',').map(s => s.trim()).filter(Boolean);
+    document.getElementById('cfg-events').value = eventDates.join('\n');
+    if (eventDates.length) {
+      document.getElementById('event-note').textContent =
+        `${eventDates.length} date${eventDates.length !== 1 ? 's' : ''} currently blocked.`;
+    }
+
+    // NSE Holidays
+    const holidays = (cfg.NSE_HOLIDAYS || '').split(',').map(s => s.trim()).filter(Boolean);
+    document.getElementById('cfg-holidays').value = holidays.join('\n');
+    if (holidays.length) {
+      document.getElementById('holiday-note').textContent =
+        `${holidays.length} holiday${holidays.length !== 1 ? 's' : ''} configured.`;
+    }
+
+    const snsOn = (cfg.SNS_EXECUTE_ENABLED || 'false') === 'true';
+    document.getElementById('cfg-sns').checked    = snsOn;
+    document.getElementById('sns-label').textContent = snsOn ? 'Enabled' : 'Disabled';
+  } catch(e) { console.error('Config load error:', e); }
+}
+
+async function setMode(mode) {
+  if (mode === 'LIVE' && !confirm(
+    'Switch to LIVE mode?\n\n' +
+    'Real orders will be placed with real money.\n\n' +
+    'Make sure broker credentials are configured and tested.\n\n' +
+    'Continue?'
+  )) return;
+  try {
+    const r = await fetch(`${API_BASE}/config`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ MODE: mode }),
+    });
+    if (r.ok) {
+      toast(`Mode set to ${mode}`, mode === 'LIVE' ? 'error' : 'success');
+      loadConfig();
+    } else {
+      toast('Failed to set mode', 'error');
+    }
+  } catch(e) { toast('Failed: ' + e.message, 'error'); }
+}
+
+async function saveConfig() {
+  const snsOn = document.getElementById('cfg-sns').checked;
+  document.getElementById('sns-label').textContent = snsOn ? 'Enabled' : 'Disabled';
+  const payload = {
+    MAX_DAILY_LOSS:      document.getElementById('cfg-maxloss').value,
+    MAX_POSITIONS:       document.getElementById('cfg-maxpos').value,
+    MIN_SIGNAL_STRENGTH: document.getElementById('cfg-minstr').value,
+    ZSCORE_THRESHOLD:    document.getElementById('cfg-zentry').value,
+    ZSCORE_EXIT:         document.getElementById('cfg-zexit').value,
+    LOOKBACK_WINDOW:     document.getElementById('cfg-lookback').value,
+    ARBITRAGE_THRESHOLD: document.getElementById('cfg-arb').value,
+    BROKER:              document.getElementById('cfg-broker').value,
+    SNS_EXECUTE_ENABLED: snsOn ? 'true' : 'false',
+  };
+  try {
+    const r = await fetch(`${API_BASE}/config`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify(payload),
+    });
+    if (r.ok) toast('Settings saved', 'success');
+    else      toast('Save failed', 'error');
+  } catch(e) { toast('Save failed', 'error'); }
+}
+
+// ─────────────────────────────────────────────────────────
+//  Event Calendar
+// ─────────────────────────────────────────────────────────
+
+// Known high-impact Indian market events for 2025
+const KNOWN_EVENTS_2025 = [
+  "2025-02-01",  // Union Budget 2025
+  "2025-04-04",  // RBI MPC (April)
+  "2025-06-04",  // RBI MPC (June)
+  "2025-08-06",  // RBI MPC (August)
+  "2025-10-01",  // RBI MPC (October)
+  "2025-12-03",  // RBI MPC (December)
+];
+
+function addKnownEvents() {
+  const ta     = document.getElementById('cfg-events');
+  const existing = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+  const merged   = [...new Set([...existing, ...KNOWN_EVENTS_2025])].sort();
+  ta.value = merged.join('\n');
+  document.getElementById('event-note').textContent =
+    `Added ${KNOWN_EVENTS_2025.length} known 2025 events (Budget + 6× RBI MPC).`;
+}
+
+async function saveEventDates() {
+  const raw   = document.getElementById('cfg-events').value;
+  const dates = raw.split('\n').map(s => s.trim()).filter(s => /^\d{4}-\d{2}-\d{2}$/.test(s));
+  const invalid = raw.split('\n').map(s => s.trim()).filter(s => s && !/^\d{4}-\d{2}-\d{2}$/.test(s));
+
+  if (invalid.length) {
+    toast(`Invalid date format: ${invalid.join(', ')}. Use YYYY-MM-DD`, 'error');
+    return;
+  }
+  try {
+    const r = await fetch(`${API_BASE}/config`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ EVENT_DATES: dates.join(',') }),
+    });
+    if (r.ok) {
+      toast(`Saved ${dates.length} blocked date${dates.length !== 1 ? 's' : ''}`, 'success');
+      document.getElementById('event-note').textContent =
+        `${dates.length} dates saved. Scanner will block trading on these days.`;
+    } else {
+      toast('Save failed', 'error');
+    }
+  } catch(e) { toast('Save failed', 'error'); }
+}
+
+// ─────────────────────────────────────────────────────────
+//  NSE Holidays
+// ─────────────────────────────────────────────────────────
+
+const NSE_HOLIDAYS_2025 = [
+  "2025-02-26",  // Mahashivratri
+  "2025-03-14",  // Holi
+  "2025-03-31",  // Id-Ul-Fitr (Eid)
+  "2025-04-14",  // Dr. B.R. Ambedkar Jayanti
+  "2025-04-18",  // Good Friday
+  "2025-05-01",  // Maharashtra Day
+  "2025-08-15",  // Independence Day
+  "2025-08-27",  // Ganesh Chaturthi
+  "2025-10-02",  // Mahatma Gandhi Jayanti
+  "2025-10-24",  // Diwali – Laxmi Pujan
+  "2025-11-05",  // Guru Nanak Jayanti
+  "2025-12-25",  // Christmas
+];
+
+const NSE_HOLIDAYS_2026 = [
+  "2026-01-26",  // Republic Day
+  "2026-03-03",  // Holi
+  "2026-03-20",  // Id-Ul-Fitr (Eid) – approx.
+  "2026-04-03",  // Good Friday
+  "2026-04-14",  // Dr. B.R. Ambedkar Jayanti
+  "2026-05-01",  // Maharashtra Day
+  "2026-08-15",  // Independence Day
+  "2026-09-14",  // Ganesh Chaturthi – approx.
+  "2026-10-02",  // Mahatma Gandhi Jayanti
+  "2026-11-12",  // Diwali – Laxmi Pujan – approx.
+  "2026-11-23",  // Guru Nanak Jayanti – approx.
+  "2026-12-25",  // Christmas
+];
+
+function addNseHolidays2025() {
+  const ta       = document.getElementById('cfg-holidays');
+  const existing = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+  const merged   = [...new Set([...existing, ...NSE_HOLIDAYS_2025])].sort();
+  ta.value = merged.join('\n');
+  document.getElementById('holiday-note').textContent =
+    `Added ${NSE_HOLIDAYS_2025.length} NSE holidays for 2025.`;
+}
+
+function addNseHolidays2026() {
+  const ta       = document.getElementById('cfg-holidays');
+  const existing = ta.value.split('\n').map(s => s.trim()).filter(Boolean);
+  const merged   = [...new Set([...existing, ...NSE_HOLIDAYS_2026])].sort();
+  ta.value = merged.join('\n');
+  document.getElementById('holiday-note').textContent =
+    `Added ${NSE_HOLIDAYS_2026.length} NSE holidays for 2026 (some dates approximate — verify with NSE).`;
+}
+
+async function saveHolidays() {
+  const raw   = document.getElementById('cfg-holidays').value;
+  const dates = raw.split('\n').map(s => s.trim()).filter(s => /^\d{4}-\d{2}-\d{2}$/.test(s));
+  const invalid = raw.split('\n').map(s => s.trim()).filter(s => s && !/^\d{4}-\d{2}-\d{2}$/.test(s));
+  if (invalid.length) {
+    toast(`Invalid date format: ${invalid.join(', ')}`, 'error');
+    return;
+  }
+  try {
+    const r = await fetch(`${API_BASE}/config`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ NSE_HOLIDAYS: dates.join(',') }),
+    });
+    if (r.ok) {
+      toast(`Saved ${dates.length} NSE holiday${dates.length !== 1 ? 's' : ''}`, 'success');
+      document.getElementById('holiday-note').textContent =
+        `${dates.length} holidays saved. Scanner will skip these dates.`;
+    } else {
+      toast('Save failed', 'error');
+    }
+  } catch(e) { toast('Save failed', 'error'); }
+}
+
+async function checkAuth() {
+  const detail = document.getElementById('auth-status-detail');
+  const badge  = document.getElementById('broker-badge');
+  detail.textContent = 'Checking connection…';
+  badge.textContent  = '…';
+  try {
+    const r = await fetch(`${API_BASE}/auth/status`);
+    const d = await r.json();
+    if (d.connected) {
+      detail.innerHTML = `<span class="up">✓ Connected</span><br>
+        Broker: <b>${d.broker}</b><br>
+        Checked: ${fmtTime(d.timestamp)}<br>
+        Feed token: ${d.feed_token ? '✓' : '–'}`;
+      badge.textContent = d.broker + ' ✓';
+      badge.className   = 'badge badge-ok';
+    } else {
+      detail.innerHTML = `<span class="down">✗ Disconnected</span><br>${d.error || 'Unknown error'}`;
+      badge.textContent = 'Broker ✗';
+      badge.className   = 'badge badge-err';
+    }
+  } catch(e) {
+    detail.innerHTML = `<span class="down">✗ Error</span><br>${e.message}`;
+    badge.textContent = 'Broker ✗';
+    badge.className   = 'badge badge-err';
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+//  P&L tab
+// ─────────────────────────────────────────────────────────
+async function loadPnl() {
+  try {
+    const [pnlR, posR, histR] = await Promise.all([
+      fetch(`${API_BASE}/pnl`),
+      fetch(`${API_BASE}/positions`),
+      fetch(`${API_BASE}/pnl/history?days=30`),
+    ]);
+    const pnl  = await pnlR.json();
+    const pos  = await posR.json();
+    const hist = await histR.json();
+
+    const v = parseFloat(pnl.realised_pnl || 0);
+    const el = document.getElementById('pnl-today');
+    el.textContent = '₹' + v.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    el.className   = 'value ' + (v >= 0 ? 'up' : 'down');
+    document.getElementById('pnl-trades').textContent    = (pnl.trades || 0) + ' trades today';
+    document.getElementById('pnl-open-count').textContent = pos.length;
+
+    if (hist.length) {
+      const labels = hist.map(h => h.date);
+      const vals   = hist.map(h => parseFloat(h.realised_pnl || 0));
+      pnlChart.data.labels = labels;
+      pnlChart.data.datasets[0].data            = vals;
+      pnlChart.data.datasets[0].backgroundColor = vals.map(x => x >= 0 ? '#2ea04340' : '#da363640');
+      pnlChart.data.datasets[0].borderColor     = vals.map(x => x >= 0 ? '#3fb950'   : '#f85149');
+      pnlChart.update('none');
+
+      document.getElementById('pnl-history').innerHTML = [...hist].reverse().map(h => {
+        const hv = parseFloat(h.realised_pnl || 0);
+        return `<tr>
+          <td>${h.date}</td>
+          <td class="${hv>=0?'up':'down'}">₹${hv.toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
+          <td>${h.trades || 0}</td>
+          <td>${h.mode || '–'}</td>
+        </tr>`;
+      }).join('');
+    } else {
+      document.getElementById('pnl-history').innerHTML =
+        '<tr><td colspan="4" style="text-align:center; color:#484f58; padding:32px;">No P&L history yet</td></tr>';
+    }
+  } catch(e) { console.error('P&L load error:', e); }
+}
+
+// ─────────────────────────────────────────────────────────
+//  DAILY PLAN tab
+// ─────────────────────────────────────────────────────────
+const STRATEGY_EMOJI = {
+  WAIT:            '⏸️',
+  TRIPLE_CALENDAR: '🦋',
+  ARB_SYNTHETIC:   '⚡',
+  BUY_STRADDLE:    '💥',
+  SELL_STRADDLE:   '📉',
+  BUY_STRANGLE:    '🌪️',
+};
+const STRATEGY_LABEL = {
+  WAIT:            'Wait – No Actionable Signal',
+  TRIPLE_CALENDAR: 'Triple Calendar Spread',
+  ARB_SYNTHETIC:   'Synthetic Arbitrage',
+  BUY_STRADDLE:    'Buy ATM Straddle',
+  SELL_STRADDLE:   'Sell ATM Straddle',
+  BUY_STRANGLE:    'Buy OTM Strangle',
+};
+
+async function loadDailyPlan() {
+  try {
+    const r = await fetch(`${API_BASE}/daily-plan`);
+    if (!r.ok) return;
+    const plan = await r.json();
+    if (!plan || !plan.strategy) {
+      document.getElementById('plan-name').textContent = 'No plan available yet';
+      return;
+    }
+
+    const strat = plan.strategy || 'WAIT';
+    const hero  = document.getElementById('plan-hero');
+
+    // Remove old colour class, add new one
+    hero.className = 'plan-hero plan-' + strat;
+
+    document.getElementById('plan-emoji').textContent  = plan.strategy_emoji || STRATEGY_EMOJI[strat] || '⏸️';
+    document.getElementById('plan-name').textContent   = STRATEGY_LABEL[strat] || strat;
+    document.getElementById('plan-reason').textContent = plan.reason   || '';
+    document.getElementById('plan-risk').textContent   = plan.risk_note || '';
+
+    // Legs
+    const legsEl = document.getElementById('plan-legs');
+    const legs   = plan.legs || [];
+    if (legs.length) {
+      legsEl.style.display = 'block';
+      legsEl.innerHTML = legs.map(leg => {
+        const isBuy = leg.action === 'BUY';
+        const cls   = isBuy ? 'plan-leg-buy' : 'plan-leg-sell';
+        const icon  = isBuy ? '✅' : '🔴';
+        return `<div class="plan-leg ${cls}">${icon} <b>${leg.action}</b> ${leg.qty}× ${leg.symbol} @ ${leg.order_type}${leg.expiry ? ' <span style="color:#484f58">['+leg.expiry+']</span>' : ''}</div>`;
+      }).join('');
+    } else {
+      legsEl.style.display = 'none';
+    }
+
+    // Stats
+    const vix      = plan.vix || 0;
+    const ivSpread = plan.iv_vix_spread || 0;
+    document.getElementById('ps-vix').textContent      = vix > 0 ? parseFloat(vix).toFixed(1) : '–';
+    document.getElementById('ps-ivspread').textContent = ivSpread !== 0 ? (ivSpread > 0 ? '+' : '') + parseFloat(ivSpread).toFixed(1) : '–';
+    document.getElementById('ps-regime').textContent   = plan.trading_regime || '–';
+    document.getElementById('ps-strength').textContent = plan.strength > 0 ? parseFloat(plan.strength).toFixed(1) + '/5' : '–';
+    document.getElementById('ps-capital').textContent  = plan.capital_est_fmt || (plan.capital_est > 0 ? '₹' + parseInt(plan.capital_est).toLocaleString('en-IN') : '–');
+    document.getElementById('ps-qty').textContent      = plan.qty > 0 ? plan.qty + ' lots' : '–';
+
+    document.getElementById('plan-updated').textContent = 'Plan updated on latest scan';
+
+    // Also refresh intraday plan when daily plan tab loads
+    loadIntradayPlan();
+  } catch(e) { console.error('Daily plan error:', e); }
+}
+
+async function loadIntradayPlan() {
+  try {
+    const r = await fetch(`${API_BASE}/intraday-plan`);
+    if (!r.ok) return;
+    const plan = await r.json();
+
+    const card    = document.getElementById('intraday-card');
+    const loading = document.getElementById('intraday-loading');
+    const body    = document.getElementById('intraday-body');
+
+    if (!plan || !plan.strategy) {
+      loading.textContent = 'No intraday plan yet — generated at 9:30 AM each trading day.';
+      body.style.display  = 'none';
+      return;
+    }
+
+    loading.style.display = 'none';
+    body.style.display    = 'block';
+
+    // Colour border by strategy
+    card.className = 'intraday-card intraday-' + plan.strategy;
+
+    document.getElementById('intraday-emoji').textContent      = plan.emoji       || '⏸️';
+    document.getElementById('intraday-strategy').textContent   = plan.strategy    || '–';
+    document.getElementById('intraday-confidence').textContent = plan.confidence_label || plan.confidence || '–';
+    document.getElementById('intraday-reason').textContent     = plan.reason      || '';
+    document.getElementById('intraday-generated').textContent  = plan.generated_at
+      ? '— generated ' + plan.generated_at.substring(11, 16) + ' IST' : '';
+
+    // Legs
+    const legsWrap = document.getElementById('intraday-legs-wrap');
+    const legsEl   = document.getElementById('intraday-legs');
+    const legs     = plan.legs || [];
+    if (legs.length) {
+      legsWrap.style.display = 'block';
+      legsEl.innerHTML = legs.map(leg => {
+        const isBuy = leg.action === 'BUY';
+        const cls   = isBuy ? 'plan-leg-buy' : 'plan-leg-sell';
+        const icon  = isBuy ? '✅' : '🔴';
+        return `<div class="plan-leg ${cls}">${icon} <b>${leg.action}</b> ${leg.qty}× ${leg.label}</div>`;
+      }).join('');
+    } else {
+      legsWrap.style.display = 'none';
+    }
+
+    // Notes (SL / Target / Risk)
+    const notes = document.getElementById('intraday-notes');
+    let notesHtml = '';
+    if (plan.sl_note)     notesHtml += `<div><b>SL:</b> ${plan.sl_note}</div>`;
+    if (plan.target_note) notesHtml += `<div><b>Target:</b> ${plan.target_note}</div>`;
+    if (plan.risk_note)   notesHtml += `<div style="margin-top:6px; color:#8b949e;">${plan.risk_note}</div>`;
+    notes.innerHTML = notesHtml;
+
+    // Metrics
+    const vix     = parseFloat(plan.vix || 0);
+    const gap     = parseFloat(plan.gap_pct || 0);
+    const orRange = parseFloat(plan.opening_range || 0);
+    const ivsp    = parseFloat(plan.iv_vix_spread || 0);
+    document.getElementById('im-vix').textContent     = vix > 0 ? vix.toFixed(1) : '–';
+    document.getElementById('im-gap').textContent     = gap !== 0 ? (gap > 0 ? '+' : '') + gap.toFixed(2) + '%' : '–';
+    document.getElementById('im-or').textContent      = orRange > 0 ? orRange.toFixed(0) + ' pts' : '–';
+    document.getElementById('im-ivspread').textContent= ivsp !== 0 ? (ivsp > 0 ? '+' : '') + ivsp.toFixed(1) : '–';
+    document.getElementById('im-atm').textContent     = plan.atm_strike || '–';
+    document.getElementById('im-entry').textContent   = plan.entry_window || '9:30–10:00 AM';
+    document.getElementById('im-exit').textContent    = plan.hard_exit   || '1:30 PM';
+
+  } catch(e) { console.error('Intraday plan error:', e); }
+}
+
+// ─────────────────────────────────────────────────────────
+//  VOLATILITY tab
+// ─────────────────────────────────────────────────────────
+async function loadVolatility() {
+  try {
+    // Fetch latest signal for current IV metrics
+    const [sigR, volR] = await Promise.all([
+      fetch(`${API_BASE}/signals?limit=1`),
+      fetch(`${API_BASE}/volatility?limit=60`),
+    ]);
+    const sigs    = await sigR.json();
+    const history = await volR.json();
+
+    // Current IV snapshot from latest signal
+    if (sigs.length) {
+      const L = sigs[0];
+      const callIv   = parseFloat(L.call_iv_pct || 0);
+      const putIv    = parseFloat(L.put_iv_pct  || 0);
+      const avgIv    = parseFloat(L.avg_iv_pct  || 0);
+      const vix      = parseFloat(L.india_vix   || 0);
+      const ivSpread = parseFloat(L.iv_vix_spread || 0);
+      const volSig   = L.vol_signal || 'NONE';
+
+      document.getElementById('v-call-iv').textContent = callIv > 0 ? callIv.toFixed(1) + '%' : '–';
+      document.getElementById('v-put-iv').textContent  = putIv  > 0 ? putIv.toFixed(1)  + '%' : '–';
+      document.getElementById('v-avg-iv').textContent  = avgIv  > 0 ? avgIv.toFixed(1)  + '%' : '–';
+
+      const vixEl = document.getElementById('v-vix');
+      vixEl.textContent = vix > 0 ? vix.toFixed(1) : '–';
+      vixEl.className   = 'value ' + (vix >= 25 ? 'down' : vix >= 18 ? 'warn' : 'up');
+
+      const spreadEl = document.getElementById('v-spread');
+      spreadEl.textContent = ivSpread !== 0 ? (ivSpread > 0 ? '+' : '') + ivSpread.toFixed(1) : '–';
+      spreadEl.className   = 'value ' + (ivSpread > 4 ? 'down' : ivSpread < -3 ? 'up' : 'warn');
+
+      const sigEl  = document.getElementById('v-signal');
+      const subEl  = document.getElementById('v-signal-sub');
+      const sigMap = {
+        SELL_STRADDLE: ['📉 SELL STRADDLE', 'down', 'Options overpriced'],
+        BUY_STRADDLE:  ['💥 BUY STRADDLE',  'up',   'Options cheap'],
+        BUY_STRANGLE:  ['🌪️ BUY STRANGLE',  '',     'VIX spike — tail risk'],
+        NONE:          ['–',                 '',     'No vol signal'],
+      };
+      const [sLabel, sCls, sDesc] = sigMap[volSig] || sigMap['NONE'];
+      sigEl.textContent = sLabel;
+      sigEl.className   = 'value ' + sCls;
+      subEl.textContent = sDesc;
+
+      document.getElementById('v-prem').textContent    = L.straddle_premium   ? L.straddle_premium + ' pts' : '–';
+      document.getElementById('v-cost').textContent    = L.straddle_cost_inr  ? '₹' + parseInt(L.straddle_cost_inr||0).toLocaleString('en-IN') : '–';
+      document.getElementById('v-be-up').textContent   = L.breakeven_upper    || '–';
+      document.getElementById('v-be-dn').textContent   = L.breakeven_lower    || '–';
+      document.getElementById('v-move').textContent    = L.breakeven_move_pct ? L.breakeven_move_pct + '%' : '–';
+      document.getElementById('v-capital').textContent = L.capital_needed > 0 ? '₹' + parseInt(L.capital_needed||0).toLocaleString('en-IN') : '–';
+    }
+
+    // Charts from history (oldest → newest)
+    if (history.length) {
+      const rev    = [...history].reverse();
+      const times  = rev.map(r => fmtTime(r.timestamp));
+      const avgIvs = rev.map(r => parseFloat(r.avg_iv_pct  || 0));
+      const vixes  = rev.map(r => parseFloat(r.india_vix   || 0));
+      const spreads = rev.map(r => parseFloat(r.iv_vix_spread || 0));
+
+      ivChart.data.labels = times;
+      ivChart.data.datasets[0].data = avgIvs;
+      ivChart.data.datasets[1].data = vixes;
+      ivChart.update('none');
+
+      updateChart(ivSpreadChart, times, spreads);
+      // colour bars by sign
+      ivSpreadChart.data.datasets[0].backgroundColor = spreads.map(s => s > 4 ? '#f8514940' : s < -3 ? '#3fb95040' : '#e3b34140');
+      ivSpreadChart.data.datasets[0].borderColor      = spreads.map(s => s > 4 ? '#f85149' : s < -3 ? '#3fb950' : '#e3b341');
+      ivSpreadChart.update('none');
+    }
+  } catch(e) { console.error('Volatility load error:', e); }
+}
+
+// ─────────────────────────────────────────────────────────
+//  Auto-refresh
+// ─────────────────────────────────────────────────────────
+loadDailyPlan();
+refreshScanner();
+setInterval(() => {
+  if (activeTab === 'dailyplan')  loadDailyPlan();
+  if (activeTab === 'scanner')    refreshScanner();
+  if (activeTab === 'volatility') loadVolatility();
+  if (activeTab === 'positions')  loadPositions();
+}, REFRESH);
+</script>
+</body>
+</html>

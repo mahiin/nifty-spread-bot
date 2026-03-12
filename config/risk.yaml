@@ -1,0 +1,26 @@
+# ─────────────────────────────────────────────────────────────
+#  Risk Manager – Hard Limits
+# ─────────────────────────────────────────────────────────────
+
+# Daily P&L limits
+daily_max_loss: 5000          # Stop all trading if daily loss exceeds ₹5k
+daily_max_profit: 15000       # Lock profits, stop trading for day
+
+# Per-trade stoploss
+spread_stoploss_points: 20    # Exit if curve_diff moves 20 pts against us
+spread_target_points: 15      # Exit when curve_diff reverts 15 pts
+arb_stoploss_points: 12       # Arb stoploss (mispricing expands further)
+
+# Position limits
+max_concurrent_positions: 3   # Max butterfly sets open at once
+max_consecutive_losses: 3     # Pause 30 min after 3 consecutive losses
+
+# Capital protection
+max_capital_drawdown_pct: 15  # If drawdown > 15% of capital, halt all trading
+
+# Time controls (IST)
+entry_cutoff_time: "14:30"    # No new entries after 2:30 PM
+exit_all_by_time: "15:10"     # Force close all positions by 3:10 PM
+
+# Signal strength minimum
+min_signal_strength: 2.5      # Only execute if combined score >= 2.5

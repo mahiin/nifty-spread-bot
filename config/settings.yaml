@@ -1,0 +1,32 @@
+# ─────────────────────────────────────────────────────────────
+#  NIFTY Triple Calendar Spread Bot – Settings
+# ─────────────────────────────────────────────────────────────
+
+mode: PAPER            # PAPER | LIVE
+
+# Underlying
+underlying: NIFTY
+lot_size: 75
+
+# Capital
+trading_capital: 500000   # ₹5L
+
+# Signal engine
+zscore_threshold: 2.0      # Z-score to trigger spread signal
+zscore_exit: 0.5           # Z-score to exit (reversion)
+lookback_window: 50        # bars for rolling mean/std
+fixed_threshold: 35        # fallback fixed threshold
+arbitrage_threshold: 15    # put-call parity deviation (points)
+
+# Scheduling
+scan_interval_seconds: 30
+
+# Broker (set real values as Lambda env vars, not here)
+broker: zerodha            # zerodha | upstox | angel
+
+# Alerts
+telegram_enabled: true
+sns_execute_enabled: false  # set true to auto-execute via SNS
+
+# Dashboard
+dashboard_refresh_seconds: 5
