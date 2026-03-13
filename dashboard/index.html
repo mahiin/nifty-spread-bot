@@ -198,9 +198,43 @@
     @media (max-width: 640px) {
       .charts, .ctrl-grid { grid-template-columns: 1fr; }
     }
+
+    /* ── Login screen ── */
+    #login-screen {
+      position: fixed; inset: 0; background: #0d1117; z-index: 10000;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .login-card {
+      background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+      padding: 36px 40px; width: 320px; text-align: center;
+    }
+    .login-card h2 { color: #58a6ff; font-size: 18px; margin-bottom: 6px; }
+    .login-card p  { color: #8b949e; font-size: 12px; margin-bottom: 24px; }
+    .login-card input {
+      width: 100%; background: #21262d; border: 1px solid #30363d; border-radius: 6px;
+      color: #c9d1d9; padding: 10px 12px; font-size: 14px; margin-bottom: 12px;
+    }
+    .login-card input:focus { outline: none; border-color: #58a6ff; }
+    .login-card button {
+      width: 100%; background: #238636; color: #fff; border: none; border-radius: 6px;
+      padding: 10px; font-size: 13px; font-weight: 600; cursor: pointer;
+    }
+    .login-card button:hover { opacity: 0.85; }
+    #login-error { color: #f85149; font-size: 12px; margin-top: 10px; min-height: 16px; }
   </style>
 </head>
 <body>
+
+<div id="login-screen">
+  <div class="login-card">
+    <h2>NIFTY Spread Bot</h2>
+    <p>Enter your dashboard password to continue</p>
+    <input type="password" id="login-pw" placeholder="Password"
+           onkeydown="if(event.key==='Enter') doLogin()" />
+    <button onclick="doLogin()">Login</button>
+    <div id="login-error"></div>
+  </div>
+</div>
 
 <header>
   <div id="status-dot"></div>
@@ -577,6 +611,14 @@
           <label>Min Signal Strength</label>
           <input type="number" id="cfg-minstr" value="2.5" min="0" max="5" step="0.5" />
         </div>
+        <div class="form-group">
+          <label>Alert Cooldown (mins)</label>
+          <input type="number" id="cfg-cooldown" value="15" min="1" max="120" step="1" />
+        </div>
+      </div>
+      <div style="font-size:11px; color:#484f58; margin-bottom:10px;">
+        Alert cooldown prevents duplicate Telegram alerts for the same signal type within N minutes.
+        Set to 1 to disable deduplication.
       </div>
       <button class="btn btn-primary" onclick="saveConfig()">Save Risk Settings</button>
     </div>
@@ -795,6 +837,53 @@
 <footer>NIFTY Spread Bot Control Panel &nbsp;|&nbsp; Angel One SmartAPI</footer>
 
 <script>
+// ─────────────────────────────────────────────────────────
+//  Auth
+// ─────────────────────────────────────────────────────────
+const SESSION_KEY = 'nifty_bot_token';
+
+// Patch fetch to inject token header on every API call
+const _origFetch = window.fetch.bind(window);
+window.fetch = (url, opts = {}) => {
+  const token = sessionStorage.getItem(SESSION_KEY);
+  if (token && typeof url === 'string' && url.startsWith(
+      window.API_GATEWAY_URL || "https://dyqeo9m3mk.execute-api.ap-south-1.amazonaws.com")) {
+    opts = { ...opts, headers: { ...(opts.headers || {}), 'x-dashboard-token': token } };
+  }
+  return _origFetch(url, opts);
+};
+
+async function doLogin() {
+  const pw = document.getElementById('login-pw').value.trim();
+  if (!pw) return;
+  const apiBase = window.API_GATEWAY_URL || "https://dyqeo9m3mk.execute-api.ap-south-1.amazonaws.com";
+  try {
+    const r = await _origFetch(`${apiBase}/health`, {
+      headers: { 'x-dashboard-token': pw }
+    });
+    if (r.ok) {
+      sessionStorage.setItem(SESSION_KEY, pw);
+      document.getElementById('login-screen').style.display = 'none';
+      initApp();
+    } else {
+      document.getElementById('login-error').textContent = 'Wrong password';
+    }
+  } catch(e) {
+    document.getElementById('login-error').textContent = 'Connection error';
+  }
+}
+
+function initApp() {
+  loadDailyPlan();
+  refreshScanner();
+  setInterval(() => {
+    if (activeTab === 'dailyplan')  loadDailyPlan();
+    if (activeTab === 'scanner')    refreshScanner();
+    if (activeTab === 'volatility') loadVolatility();
+    if (activeTab === 'positions')  loadPositions();
+  }, REFRESH);
+}
+
 // ─────────────────────────────────────────────────────────
 //  Config
 // ─────────────────────────────────────────────────────────
@@ -1208,7 +1297,8 @@ async function loadConfig() {
     document.getElementById('cfg-zentry').value   = cfg.ZSCORE_THRESHOLD     || 2.0;
     document.getElementById('cfg-zexit').value    = cfg.ZSCORE_EXIT          || 0.5;
     document.getElementById('cfg-lookback').value = cfg.LOOKBACK_WINDOW      || 50;
-    document.getElementById('cfg-arb').value      = cfg.ARBITRAGE_THRESHOLD  || 15;
+    document.getElementById('cfg-arb').value      = cfg.ARBITRAGE_THRESHOLD     || 15;
+    document.getElementById('cfg-cooldown').value = cfg.ALERT_COOLDOWN_MINUTES  || 15;
     if (cfg.BROKER) document.getElementById('cfg-broker').value = cfg.BROKER;
 
     // Event calendar
@@ -1265,8 +1355,9 @@ async function saveConfig() {
     ZSCORE_THRESHOLD:    document.getElementById('cfg-zentry').value,
     ZSCORE_EXIT:         document.getElementById('cfg-zexit').value,
     LOOKBACK_WINDOW:     document.getElementById('cfg-lookback').value,
-    ARBITRAGE_THRESHOLD: document.getElementById('cfg-arb').value,
-    BROKER:              document.getElementById('cfg-broker').value,
+    ARBITRAGE_THRESHOLD:    document.getElementById('cfg-arb').value,
+    ALERT_COOLDOWN_MINUTES: document.getElementById('cfg-cooldown').value,
+    BROKER:                 document.getElementById('cfg-broker').value,
     SNS_EXECUTE_ENABLED: snsOn ? 'true' : 'false',
   };
   try {
@@ -1698,16 +1789,17 @@ async function loadVolatility() {
 }
 
 // ─────────────────────────────────────────────────────────
-//  Auto-refresh
+//  Startup — check auth then init or show login screen
 // ─────────────────────────────────────────────────────────
-loadDailyPlan();
-refreshScanner();
-setInterval(() => {
-  if (activeTab === 'dailyplan')  loadDailyPlan();
-  if (activeTab === 'scanner')    refreshScanner();
-  if (activeTab === 'volatility') loadVolatility();
-  if (activeTab === 'positions')  loadPositions();
-}, REFRESH);
+(function() {
+  const saved = sessionStorage.getItem(SESSION_KEY);
+  if (saved) {
+    // Already authenticated this session
+    document.getElementById('login-screen').style.display = 'none';
+    initApp();
+  }
+  // If no saved token, login screen stays visible (default)
+})();
 </script>
 </body>
 </html>

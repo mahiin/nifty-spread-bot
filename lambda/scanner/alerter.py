@@ -22,8 +22,12 @@ def send_telegram(record: dict):
     strength    = record.get("signal_strength", "0")
     zscore      = record.get("zscore", "0")
     curve_diff  = record.get("curve_diff", "0")
-    sl          = record.get("stoploss_diff", "-")
-    tgt         = record.get("target_diff", "-")
+
+    # Use arb SL/target fields for arb-only signals, spread fields otherwise
+    is_arb_only = arb_sig not in ("NONE", "") and spread_sig == "NONE"
+    sl          = record.get("arb_stoploss", "-") if is_arb_only else record.get("stoploss_diff", "-")
+    tgt         = record.get("arb_target",   "-") if is_arb_only else record.get("target_diff",   "-")
+    sl_label    = "(arb mispricing)" if is_arb_only else "(curve_diff)"
     qty         = record.get("recommended_qty", "0")
 
     # Emoji by signal type
@@ -57,8 +61,8 @@ def send_telegram(record: dict):
         f"\n"
         f"Strength   : {strength}/5\n"
         f"Qty        : {qty} units\n"
-        f"StopLoss   : {sl} (curve_diff)\n"
-        f"Target     : {tgt} (curve_diff)\n"
+        f"StopLoss   : {sl} {sl_label}\n"
+        f"Target     : {tgt} {sl_label}\n"
         f"\n"
         f"DTE : {record.get('days_to_expiry','')} days | {record.get('expiry_bias','')}"
         f"{'  ✅ Optimal window' if opt_window else ''}\n"

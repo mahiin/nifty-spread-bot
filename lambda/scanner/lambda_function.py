@@ -86,11 +86,12 @@ def _load_config() -> dict:
         "TRADING_CAPITAL":     os.environ.get("TRADING_CAPITAL",     "500000"),
         "LOT_SIZE":            os.environ.get("LOT_SIZE",            "75"),
         "ARBITRAGE_THRESHOLD": os.environ.get("ARBITRAGE_THRESHOLD", "15"),
-        "SNS_EXECUTE_ENABLED": os.environ.get("SNS_EXECUTE_ENABLED", "false"),
-        "MODE":                os.environ.get("MODE",                "PAPER"),
-        "MIN_SIGNAL_STRENGTH": os.environ.get("MIN_SIGNAL_STRENGTH", "2.5"),
-        "EVENT_DATES":         os.environ.get("EVENT_DATES",         ""),
-        "NSE_HOLIDAYS":        os.environ.get("NSE_HOLIDAYS",        ""),
+        "SNS_EXECUTE_ENABLED":    os.environ.get("SNS_EXECUTE_ENABLED",    "false"),
+        "MODE":                   os.environ.get("MODE",                   "PAPER"),
+        "MIN_SIGNAL_STRENGTH":    os.environ.get("MIN_SIGNAL_STRENGTH",    "2.5"),
+        "EVENT_DATES":            os.environ.get("EVENT_DATES",            ""),
+        "NSE_HOLIDAYS":           os.environ.get("NSE_HOLIDAYS",           ""),
+        "ALERT_COOLDOWN_MINUTES": os.environ.get("ALERT_COOLDOWN_MINUTES", "15"),
     }
     try:
         resp = cfg_tbl.scan(ProjectionExpression="config_key, config_value")
@@ -232,6 +233,44 @@ def _intraday_plan_needed() -> bool:
         return True
 
 
+def _signal_key(record: dict) -> str:
+    """Stable dedup key: spread_signal|arb_signal."""
+    return f"{record.get('spread_signal','NONE')}|{record.get('arbitrage_signal','NONE')}"
+
+
+def _should_alert(record: dict, cooldown_minutes: int) -> bool:
+    """
+    Return True if a Telegram alert should be sent for this signal.
+    Suppressed when the same signal type was sent within cooldown_minutes.
+    Always alerts if the signal type changed.
+    """
+    sig_key = _signal_key(record)
+    try:
+        last_ts  = cfg_tbl.get_item(Key={"config_key": "LAST_ALERT_TS" }).get("Item", {}).get("config_value", "")
+        last_sig = cfg_tbl.get_item(Key={"config_key": "LAST_ALERT_SIG"}).get("Item", {}).get("config_value", "")
+        if last_sig != sig_key:
+            return True   # signal type changed — always alert immediately
+        if last_ts:
+            last_dt = datetime.fromisoformat(last_ts)
+            if last_dt.tzinfo is None:
+                last_dt = IST.localize(last_dt)
+            elapsed_min = (datetime.now(IST) - last_dt).total_seconds() / 60
+            if elapsed_min < cooldown_minutes:
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def _record_alert(record: dict) -> None:
+    """Persist current signal key + timestamp for cooldown tracking."""
+    try:
+        cfg_tbl.put_item(Item={"config_key": "LAST_ALERT_TS",  "config_value": datetime.now(IST).isoformat()})
+        cfg_tbl.put_item(Item={"config_key": "LAST_ALERT_SIG", "config_value": _signal_key(record)})
+    except Exception:
+        pass
+
+
 def _get_prev_vix() -> float:
     """Fetch VIX from the most recent DynamoDB signal record (prior scan)."""
     try:
@@ -342,8 +381,16 @@ def lambda_handler(event, context):
             vol_data["volume_signal"],
             exp_b,
         )
-        base_qty = recommended_qty(strength, CAPITAL, LOT_SIZE) if spread_signal != "NONE" else 0
-        qty      = int(base_qty * safety["size_factor"])
+        # Spread qty — sized by signal strength
+        base_qty   = recommended_qty(strength, CAPITAL, LOT_SIZE) if spread_signal != "NONE" else 0
+        spread_qty = int(base_qty * safety["size_factor"])
+
+        # Arb qty — fixed 1 lot (delta-neutral), skip if HALT
+        arb_signal_val = arb.get("arbitrage_signal", "NONE") if arb else "NONE"
+        arb_qty = LOT_SIZE if (arb_signal_val not in ("NONE", "") and safety["safe"]) else 0
+
+        # Use spread_qty if active, else arb_qty
+        qty = spread_qty if spread_signal != "NONE" else arb_qty
 
         levels = (
             compute_levels(spread_signal, cdiff)
@@ -476,8 +523,8 @@ def lambda_handler(event, context):
             "spread_signal":    spread_signal,
             "signal_strength":  str(strength),
             "recommended_qty":  str(qty),
-            "stoploss_diff":    str(levels["stoploss_diff"]),
-            "target_diff":      str(levels["target_diff"]),
+            "stoploss_diff":    str(levels["stoploss_diff"]) if spread_signal != "NONE" else str(arb.get("arb_stoploss", 0)),
+            "target_diff":      str(levels["target_diff"])   if spread_signal != "NONE" else str(arb.get("arb_target",   0)),
             "days_to_expiry":   str(dte),
             "expiry_bias":      exp_b,
             "near_oi":          str(oi_data["near_oi"]),
@@ -522,16 +569,21 @@ def lambda_handler(event, context):
         sig_tbl.put_item(Item=record)
 
         # ── Alert & auto-execute ──────────────────────────────────────────
+        COOLDOWN = int(cfg.get("ALERT_COOLDOWN_MINUTES", "15"))
+
         if not safety["safe"]:
-            send_regime_alert(record, safety)
+            if _should_alert(record, COOLDOWN):
+                send_regime_alert(record, safety)
+                _record_alert(record)
             return {"statusCode": 200, "body": json.dumps(record)}
 
         has_signal = (
             spread_signal != "NONE" and strength >= MIN_STRENGTH
         ) or arb.get("arbitrage_signal", "NONE") not in ("NONE", "")
 
-        if has_signal:
+        if has_signal and _should_alert(record, COOLDOWN):
             send_telegram(record)
+            _record_alert(record)
             if cfg.get("SNS_EXECUTE_ENABLED", "false").lower() == "true":
                 publish_to_sns(record)
 

@@ -21,6 +21,7 @@ source "$(dirname "$0")/.env"
 : "${SNS_EXECUTE_ENABLED:=false}"
 : "${INTRADAY_AUTO_EXECUTE:=true}"   # true = paper-execute intraday plan at 9:30 AM
 : "${SECRETS_NAME:=}"         # Set by setup_aws.sh. Empty = use env vars.
+: "${DASHBOARD_SECRET:=}"    # Dashboard password (empty = no auth, for backward compat)
 
 # Angel One / Zerodha credentials (only needed if NOT using Secrets Manager)
 : "${ANGEL_API_KEY:=}"
@@ -102,7 +103,8 @@ COMMON_ENV="Variables={
   ORDERS_TABLE=nifty_orders,
   CONFIG_TABLE=nifty_config,
   AWS_REGION_NAME=$REGION,
-  SECRETS_MANAGER_NAME=$SECRETS_NAME
+  SECRETS_MANAGER_NAME=$SECRETS_NAME,
+  DASHBOARD_SECRET=$DASHBOARD_SECRET
 }"
 
 # ─── Deploy or update a Lambda ───────────────────────────────────────────────

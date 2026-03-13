@@ -180,6 +180,18 @@ def _exit_reason(pos: dict, current_diff: float, dte: int) -> Optional[str]:
         if sl_diff > 0 and current_diff <= sl_diff:
             return f"STOP_LOSS (diff={current_diff:.1f} ≤ SL={sl_diff:.1f})"
 
+    # Time-based hard exit (for arb/intraday-arb positions tagged with hard_exit_time)
+    hard_exit = pos.get("hard_exit_time", "")
+    if hard_exit:
+        now_ist = datetime.now(IST)
+        try:
+            h, m = map(int, hard_exit.split(":"))
+            cutoff = now_ist.replace(hour=h, minute=m, second=0, microsecond=0)
+            if now_ist >= cutoff:
+                return f"HARD_EXIT (past {hard_exit} IST cutoff)"
+        except Exception:
+            pass
+
     return None
 
 
@@ -453,9 +465,9 @@ def _write_pnl(pnl: float) -> None:
             ),
             ExpressionAttributeNames={"#m": "mode"},
             ExpressionAttributeValues={
-                ":p":    str(round(pnl, 2)),
-                ":zero": "0",
-                ":one":  "1",
+                ":p":    round(pnl, 2),
+                ":zero": 0,
+                ":one":  1,
                 ":mode": MODE,
             },
         )

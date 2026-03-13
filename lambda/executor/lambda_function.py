@@ -182,7 +182,12 @@ def place_arb(broker, future_sym: str, call_sym: str, put_sym: str,
 
 def record_position(signal: dict, order_ids: list, trade_type: str, qty: int):
     ts = datetime.now(IST).isoformat()
-    pos_table.put_item(Item={
+    # Arb positions use arb_stoploss/arb_target; spread positions use stoploss_diff/target_diff
+    is_arb = "FUT" in trade_type
+    stoploss = signal.get("arb_stoploss", "0") if is_arb else signal.get("stoploss_diff", "0")
+    target   = signal.get("arb_target",   "0") if is_arb else signal.get("target_diff",   "0")
+
+    item = {
         "position_id":       ts,
         "timestamp":         ts,
         "trade_type":        trade_type,
@@ -192,14 +197,18 @@ def record_position(signal: dict, order_ids: list, trade_type: str, qty: int):
         "call_symbol":       signal.get("call_symbol",  ""),
         "put_symbol":        signal.get("put_symbol",   ""),
         "entry_curve_diff":  signal.get("curve_diff",   "0"),
-        "stoploss_diff":     signal.get("stoploss_diff","0"),
-        "target_diff":       signal.get("target_diff",  "0"),
+        "stoploss_diff":     str(stoploss),
+        "target_diff":       str(target),
         "qty":               str(qty),
         "order_ids":         json.dumps(order_ids),
         "status":            "OPEN",
         "mode":              MODE,
         "product":           "CARRYFORWARD",
-    })
+    }
+    if is_arb:
+        item["hard_exit_time"]  = "14:45"
+        item["strategy_type"]   = "INTRADAY_ARB"
+    pos_table.put_item(Item=item)
 
 
 # ─── Main handler ─────────────────────────────────────────────────────────
@@ -234,14 +243,18 @@ def lambda_handler(event, context):
         return {"statusCode": 200, "body": "Max positions"}
 
     strength = float(signal.get("signal_strength", 0))
-    if strength < MIN_STRENGTH:
-        print(f"[executor] Signal strength {strength:.1f} < {MIN_STRENGTH}")
-        return {"statusCode": 200, "body": "Low strength"}
 
     # ── Determine trade type and check deduplication ─────────────────────
     will_trade_spread = spread_signal in ("SELL_BUTTERFLY", "BUY_BUTTERFLY")
     will_trade_arb    = arb_signal    in ("BUY_FUT_SELL_CALL_BUY_PUT",
                                           "SELL_FUT_BUY_CALL_SELL_PUT")
+
+    # MIN_STRENGTH only applies to spread trades; arb has its own quality check
+    if will_trade_spread and strength < MIN_STRENGTH:
+        print(f"[executor] Spread strength {strength:.1f} < {MIN_STRENGTH}, skipping spread")
+        will_trade_spread = False
+        if not will_trade_arb:
+            return {"statusCode": 200, "body": "Low strength, no arb signal"}
 
     if not will_trade_spread and not will_trade_arb:
         return {"statusCode": 200, "body": "No actionable signal"}
