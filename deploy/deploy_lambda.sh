@@ -72,40 +72,45 @@ build_zip() {
 # ─── Shared env vars ──────────────────────────────────────────────────────────
 # NOTE: Sensitive credentials should be stored in Secrets Manager (SECRETS_MANAGER_NAME).
 # Setting them here in env vars is a fallback for PAPER mode / local testing.
-COMMON_ENV="Variables={
-  BROKER=$BROKER,
-  ANGEL_API_KEY=$ANGEL_API_KEY,
-  ANGEL_CLIENT_ID=$ANGEL_CLIENT_ID,
-  ANGEL_PASSWORD=$ANGEL_PASSWORD,
-  ANGEL_TOTP_SECRET=$ANGEL_TOTP_SECRET,
-  ZERODHA_API_KEY=$ZERODHA_API_KEY,
-  ZERODHA_ACCESS_TOKEN=$ZERODHA_ACCESS_TOKEN,
-  TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID,
-  TRADING_CAPITAL=$TRADING_CAPITAL,
-  MODE=$MODE,
-  UNDERLYING=NIFTY,
-  LOT_SIZE=75,
-  ZSCORE_THRESHOLD=2.0,
-  ZSCORE_EXIT=0.5,
-  LOOKBACK_WINDOW=50,
-  ARBITRAGE_THRESHOLD=15,
-  MAX_DAILY_LOSS=5000,
-  MAX_POSITIONS=3,
-  MIN_SIGNAL_STRENGTH=2.5,
-  MIN_MARGIN_BUFFER=50000,
-  SNS_EXECUTE_ENABLED=$SNS_EXECUTE_ENABLED,
-  INTRADAY_AUTO_EXECUTE=$INTRADAY_AUTO_EXECUTE,
-  SNS_EXECUTE_TOPIC_ARN=$SNS_ARN,
-  DYNAMODB_SIGNALS_TABLE=nifty_spread_signals,
-  POSITIONS_TABLE=nifty_positions,
-  PNL_TABLE=nifty_pnl,
-  ORDERS_TABLE=nifty_orders,
-  CONFIG_TABLE=nifty_config,
-  AWS_REGION_NAME=$REGION,
-  SECRETS_MANAGER_NAME=$SECRETS_NAME,
-  DASHBOARD_SECRET=$DASHBOARD_SECRET
-}"
+# Build env JSON — JSON format handles empty strings correctly (shorthand rejects them)
+COMMON_ENV=$(python3 -c "
+import json, sys
+vars = {
+  'BROKER':                    '$BROKER',
+  'ANGEL_API_KEY':             '$ANGEL_API_KEY',
+  'ANGEL_CLIENT_ID':           '$ANGEL_CLIENT_ID',
+  'ANGEL_PASSWORD':            '$ANGEL_PASSWORD',
+  'ANGEL_TOTP_SECRET':         '$ANGEL_TOTP_SECRET',
+  'ZERODHA_API_KEY':           '$ZERODHA_API_KEY',
+  'ZERODHA_ACCESS_TOKEN':      '$ZERODHA_ACCESS_TOKEN',
+  'TELEGRAM_BOT_TOKEN':        '$TELEGRAM_BOT_TOKEN',
+  'TELEGRAM_CHAT_ID':          '$TELEGRAM_CHAT_ID',
+  'TRADING_CAPITAL':           '$TRADING_CAPITAL',
+  'MODE':                      '$MODE',
+  'UNDERLYING':                'NIFTY',
+  'LOT_SIZE':                  '75',
+  'ZSCORE_THRESHOLD':          '2.0',
+  'ZSCORE_EXIT':               '0.5',
+  'LOOKBACK_WINDOW':           '50',
+  'ARBITRAGE_THRESHOLD':       '15',
+  'MAX_DAILY_LOSS':            '5000',
+  'MAX_POSITIONS':             '3',
+  'MIN_SIGNAL_STRENGTH':       '2.5',
+  'MIN_MARGIN_BUFFER':         '50000',
+  'SNS_EXECUTE_ENABLED':       '$SNS_EXECUTE_ENABLED',
+  'INTRADAY_AUTO_EXECUTE':     '$INTRADAY_AUTO_EXECUTE',
+  'SNS_EXECUTE_TOPIC_ARN':     '$SNS_ARN',
+  'DYNAMODB_SIGNALS_TABLE':    'nifty_spread_signals',
+  'POSITIONS_TABLE':           'nifty_positions',
+  'PNL_TABLE':                 'nifty_pnl',
+  'ORDERS_TABLE':              'nifty_orders',
+  'CONFIG_TABLE':              'nifty_config',
+  'AWS_REGION_NAME':           '$REGION',
+  'SECRETS_MANAGER_NAME':      '$SECRETS_NAME',
+  'DASHBOARD_SECRET':          '$DASHBOARD_SECRET',
+}
+print(json.dumps({'Variables': vars}))
+")
 
 # ─── Deploy or update a Lambda ───────────────────────────────────────────────
 deploy_fn() {
