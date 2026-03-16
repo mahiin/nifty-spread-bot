@@ -43,6 +43,28 @@ def send_telegram(record: dict):
     regime_warn = record.get("regime_warnings", "")
     opt_window  = record.get("optimal_window", "False") == "True"
 
+    # Build arb legs block when it's an arb signal
+    arb_legs_block = ""
+    if is_arb_only:
+        strike      = record.get("arb_strike", "")
+        call_sym    = record.get("call_symbol", "")
+        put_sym     = record.get("put_symbol", "")
+        call_px     = record.get("arb_call_price", "")
+        put_px      = record.get("arb_put_price", "")
+        synthetic   = record.get("arb_synthetic_fut", "")
+        actual_fut  = record.get("arb_actual_fut", "")
+        action      = "BUY" if "BUY_FUT" in arb_sig else "SELL"
+        call_action = "SELL" if "BUY_FUT" in arb_sig else "BUY"
+        put_action  = "BUY"  if "BUY_FUT" in arb_sig else "SELL"
+        arb_legs_block = (
+            f"\n<b>Legs to trade:</b>\n"
+            f"  {action} Future  : {record.get('near_symbol','')} @ {actual_fut}\n"
+            f"  {call_action} Call ({strike} CE): {call_sym} @ {call_px}\n"
+            f"  {put_action} Put  ({strike} PE): {put_sym} @ {put_px}\n"
+            f"  Synthetic Fut  : {synthetic}  |  Actual: {actual_fut}\n"
+            f"  Mispricing     : {record.get('arb_mispricing','')} pts\n"
+        )
+
     msg = (
         f"{icon} <b>NIFTY SPREAD SIGNAL</b>\n"
         f"<code>{record.get('timestamp','')[:19]}</code>\n"
@@ -58,7 +80,8 @@ def send_telegram(record: dict):
         f"\n"
         f"📌 <b>Spread Signal :</b> {spread_sig}\n"
         f"⚡ <b>Arb Signal    :</b> {arb_sig} ({record.get('arb_mispricing','')} pts)\n"
-        f"\n"
+        + arb_legs_block
+        + f"\n"
         f"Strength   : {strength}/5\n"
         f"Qty        : {qty} units\n"
         f"StopLoss   : {sl} {sl_label}\n"
@@ -74,11 +97,14 @@ def send_telegram(record: dict):
         + (f"⚠️ {regime_warn}\n" if regime_warn else "")
     )
 
-    requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
-        timeout=5,
-    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[alerter] send_telegram failed: {e}")
 
 
 def send_regime_alert(record: dict, safety: dict):
@@ -116,11 +142,14 @@ def send_regime_alert(record: dict, safety: dict):
         + f"\n<i>No new positions opened. Existing positions unaffected.</i>"
     )
 
-    requests.post(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
-        timeout=5,
-    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[alerter] send_regime_alert failed: {e}")
 
 
 def send_exit_alert(events: list):
@@ -161,11 +190,14 @@ def send_exit_alert(events: list):
         elif is_exp:
             msg += "\n⚠️ <i>Force-closed due to expiry risk (DTE ≤ 3).</i>"
 
-        requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
-            timeout=5,
-        )
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+                timeout=5,
+            )
+        except Exception as e:
+            print(f"[alerter] send_exit_alert failed: {e}")
 
 
 def send_error_alert(error_msg: str, context: str = "Scanner"):
@@ -311,6 +343,96 @@ def send_options_exit_alert(events: list, mode: str = "PAPER"):
             pass
 
 
+def send_premarket_report(report: dict):
+    """
+    Send the 8:45 AM pre-market intelligence brief to Telegram.
+    Covers: FII/DII flow, PCR, max pain, day-of-week strategy, events.
+    """
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID",   "")
+    if not token or not chat_id:
+        return
+
+    # Day-of-week strategy guidance
+    dow        = report.get("day_of_week", -1)
+    day_label  = report.get("day_label", "")
+    _dow_guide = {
+        0: "✅ Monday — Best day to SELL premium (4 DTE, max theta capture)",
+        1: "✅ Tuesday — Good for premium selling (3 DTE)",
+        2: "⚠️ Wednesday — Pre-expiry. Reduce size 50%. Consider rolling/closing.",
+        3: "🚫 Thursday — Expiry day. Close existing by 12:30 PM. No new sells.",
+        4: "📅 Friday — Monthly only. Small size directional trades only.",
+    }
+    dow_note = _dow_guide.get(dow, "")
+
+    # FII/DII
+    fii_net     = report.get("fii_net_cr", 0)
+    dii_net     = report.get("dii_net_cr", 0)
+    fii_sig     = report.get("fii_signal", "FII_NEUTRAL")
+    fii_icon    = "📈" if fii_sig == "FII_BULLISH" else ("📉" if fii_sig == "FII_BEARISH" else "➡️")
+    fii_date    = report.get("fii_data_date", "")
+    # FII F&O futures (gold standard)
+    fii_fut_sig = report.get("fii_fut_signal", "FII_FUT_NEUTRAL")
+    fii_fut_net = report.get("fii_fut_net", 0)
+    fut_icon    = "🟢" if fii_fut_sig == "FII_FUT_LONG" else ("🔴" if fii_fut_sig == "FII_FUT_SHORT" else "⚪")
+
+    # Option chain
+    pcr        = report.get("pcr", 1.0)
+    pcr_sig    = report.get("pcr_signal", "PCR_NEUTRAL")
+    max_pain   = report.get("max_pain", 0)
+    call_wall  = report.get("call_wall", 0)
+    put_wall   = report.get("put_wall",  0)
+    atm_iv     = report.get("atm_iv", 0.0)
+    vix        = report.get("vix", 0.0)
+
+    # Strategy
+    strategy   = report.get("recommended_strategy", "WAIT")
+    strat_note = report.get("strategy_note", "")
+
+    # Events
+    events     = report.get("events_today", "")
+    event_line = f"\n⚠️ <b>Events today:</b> {events}" if events else ""
+
+    msg = (
+        f"🌅 <b>PRE-MARKET BRIEF — {day_label}</b>\n"
+        f"<code>{report.get('date', '')}</code>\n"
+        f"\n"
+        f"━━━ INSTITUTIONAL FLOW (prev day) ━━━\n"
+        f"{fut_icon} FII Futures Net: <b>{fii_fut_net:+,d} contracts</b>  ({fii_fut_sig})\n"
+        f"{fii_icon} FII Cash Net:    <b>₹{fii_net:+,.0f} Cr</b>  ({fii_sig})\n"
+        f"🏦 DII Cash Net:  <b>₹{dii_net:+,.0f} Cr</b>\n"
+        f"<i>Data: {fii_date}</i>\n"
+        f"\n"
+        f"━━━ OPTION CHAIN ━━━\n"
+        f"PCR: <b>{pcr:.2f}</b>  ({pcr_sig})\n"
+        f"Max Pain: <b>{max_pain}</b>  (NIFTY tends to gravitate here on expiry)\n"
+        f"Call Wall (resistance): <b>{call_wall}</b>\n"
+        f"Put Wall  (support)   : <b>{put_wall}</b>\n"
+        f"ATM IV: {atm_iv:.1f}%  |  VIX: {vix:.1f}\n"
+        f"IV Skew (put−call): {report.get('iv_skew', 0.0):+.1f}  ({report.get('iv_skew_signal', '')})\n"
+        f"\n"
+        f"━━━ TODAY'S SETUP ━━━\n"
+        f"{dow_note}\n"
+        f"\n"
+        f"Recommended: <b>{strategy}</b>\n"
+        + (f"<i>{strat_note}</i>\n" if strat_note else "")
+        + event_line
+        + f"\n"
+        f"\n<b>Entry window: 9:30–10:00 AM only</b>\n"
+        f"Hard exit: 1:30 PM (no exceptions)\n"
+        f"\n📋 <i>Open dashboard for live signals</i>"
+    )
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def send_intraday_alert(plan: dict):
     """
     Send the daily intraday strategy recommendation to Telegram at 9:30 AM.
@@ -366,6 +488,84 @@ def send_intraday_alert(plan: dict):
         + (f"\n⚠️ <i>{risk_note}</i>" if risk_note else "")
     )
 
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def send_margin_alert(margin_pct: float, available: float, capital: float):
+    """
+    Alert when margin utilization exceeds 60%.
+    Cooldown: once per hour via MARGIN_ALERT_TS in DynamoDB config.
+    """
+    import boto3
+    from datetime import datetime
+    import pytz
+    IST = pytz.timezone("Asia/Kolkata")
+
+    # Hourly cooldown check
+    try:
+        region  = os.environ.get("AWS_REGION_NAME", "ap-south-1")
+        cfg_tbl = boto3.resource("dynamodb", region_name=region).Table(
+            os.environ.get("CONFIG_TABLE", "nifty_config")
+        )
+        last_ts_item = cfg_tbl.get_item(Key={"config_key": "MARGIN_ALERT_TS"}).get("Item", {})
+        last_ts = last_ts_item.get("config_value", "")
+        if last_ts:
+            last_dt = datetime.fromisoformat(last_ts)
+            if last_dt.tzinfo is None:
+                last_dt = IST.localize(last_dt)
+            if (datetime.now(IST) - last_dt).total_seconds() < 3600:
+                return  # cooldown not expired
+        cfg_tbl.put_item(Item={"config_key": "MARGIN_ALERT_TS", "config_value": datetime.now(IST).isoformat()})
+    except Exception:
+        pass
+
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID",   "")
+    if not token or not chat_id:
+        return
+
+    msg = (
+        f"⚠️ <b>MARGIN ALERT</b>\n"
+        f"Margin used: <b>{margin_pct:.1f}%</b>\n"
+        f"Available  : ₹{available:,.0f}\n"
+        f"Capital    : ₹{capital:,.0f}\n"
+        f"\n<i>Consider reducing positions to free up margin.</i>"
+    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def send_delta_alert(delta: float, positions: list):
+    """Alert when portfolio net delta is too high (directional risk)."""
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID",   "")
+    if not token or not chat_id:
+        return
+
+    pos_lines = ""
+    for p in positions[:5]:   # show up to 5 positions
+        pos_lines += f"  • {p.get('trade_type','')} | Δ={p.get('delta', '–')}\n"
+
+    msg = (
+        f"⚠️ <b>PORTFOLIO DELTA ALERT</b>\n"
+        f"Net delta: <b>{delta:+.3f} per lot</b>\n"
+        f"Threshold: ±0.30 per lot\n"
+        f"\n<b>Open positions:</b>\n{pos_lines}"
+        f"\n<i>Hedge required — consider buying/selling a futures leg.</i>"
+    )
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",

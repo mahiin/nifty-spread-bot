@@ -24,18 +24,20 @@ Regime levels
   HALT    : Hard stop. Do NOT open new spread positions. Explain reason clearly.
 """
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional
 
 # ─── Configurable thresholds ───────────────────────────────────────────────
 
-VIX_SAFE          = 18.0    # Below this: ideal conditions for spread trading
-VIX_CAUTION       = 25.0    # Above this: spreads become unstable → HALT
-GAP_HALT_PCT      = 0.025   # 2.5%+ gap from prev close → hard halt
-GAP_CAUTION_PCT   = 0.015   # 1.5%+ gap → caution
-CURVE_EXTREME_PTS = 100.0   # curve_diff beyond ±100 pts = already distorted
-DTE_OPTIMAL_MIN   = 3       # Best window: 3–7 DTE before near expiry
-DTE_OPTIMAL_MAX   = 7
+VIX_SAFE                = 18.0    # Below this: ideal conditions for spread trading
+VIX_CAUTION             = 25.0    # Above this: spreads become unstable → HALT
+GAP_HALT_PCT            = 0.025   # 2.5%+ gap from prev close → hard halt
+GAP_CAUTION_PCT         = 0.015   # 1.5%+ gap → caution
+GAP_OPTIONS_HALT_PCT    = 0.05    # 5%+ gap → halt all options strategies
+GAP_CIRCUIT_BREAKER_PCT = 0.09    # 9%+ gap → circuit breaker (exchange near halt)
+CURVE_EXTREME_PTS       = 100.0   # curve_diff beyond ±100 pts = already distorted
+DTE_OPTIMAL_MIN         = 3       # Best window: 3–7 DTE before near expiry
+DTE_OPTIMAL_MAX         = 7
 
 
 class Regime:
@@ -62,6 +64,22 @@ _WHY_VIX_CAUTION = (
     "Reduce position size by 50%. Monitor curve diff closely."
 )
 
+_WHY_CIRCUIT_BREAKER = (
+    "CIRCUIT BREAKER: Gap opening of {gap_pct:.1f}% detected "
+    "({prev:.0f} → {spot:.0f}). "
+    "A ≥9% gap means the exchange circuit breaker may trigger. "
+    "All option strategies are halted — premiums are unreliable, "
+    "spreads are extreme, and execution may be impossible."
+)
+
+_WHY_OPTIONS_HALT = (
+    "Large gap opening: {gap_pct:.1f}% from previous close "
+    "({prev:.0f} → {spot:.0f}). "
+    "A ≥5% gap makes options pricing unreliable — implied volatility spikes, "
+    "bid-ask spreads widen dramatically, and ATM strikes shift significantly. "
+    "All options strategies halted; spread/futures positions may continue with caution."
+)
+
 _WHY_GAP_HALT = (
     "Gap opening detected: {gap_pct:.1f}% from previous close "
     "({prev:.0f} → {spot:.0f}). "
@@ -79,7 +97,7 @@ _WHY_GAP_CAUTION = (
 )
 
 _WHY_EVENT = (
-    "Today ({today}) is a blocked high-impact event date. "
+    "High-impact event within 2 days (today or tomorrow: {today}). "
     "Events like elections, budget, RBI policy announcements, and geopolitical shocks "
     "break the normal futures curve behaviour: "
     "(1) Market can move ±5–10% on the result; "
@@ -144,20 +162,30 @@ def check_trade_safety(
                 vix=vix, lo=int(VIX_SAFE), hi=int(VIX_CAUTION)
             ))
 
-    # ── 2. Gap opening ───────────────────────────────────────────────────
+    # ── 2. Gap opening (circuit breaker → options halt → spread halt) ───
     if spot_price > 0 and prev_close > 0:
         gap_pct = abs(spot_price - prev_close) / prev_close
-        if gap_pct >= GAP_HALT_PCT:
+        if gap_pct >= GAP_CIRCUIT_BREAKER_PCT:
+            reasons.append(_WHY_CIRCUIT_BREAKER.format(
+                gap_pct=gap_pct * 100, prev=prev_close, spot=spot_price
+            ))
+        elif gap_pct >= GAP_OPTIONS_HALT_PCT:
+            reasons.append(_WHY_OPTIONS_HALT.format(
+                gap_pct=gap_pct * 100, prev=prev_close, spot=spot_price
+            ))
+        elif gap_pct >= GAP_HALT_PCT:
             reasons.append(_WHY_GAP_HALT.format(
                 gap_pct=gap_pct * 100, prev=prev_close, spot=spot_price
             ))
         elif gap_pct >= GAP_CAUTION_PCT:
             warnings.append(_WHY_GAP_CAUTION.format(gap_pct=gap_pct * 100))
 
-    # ── 3. Event calendar ────────────────────────────────────────────────
-    today_str = date.today().isoformat()
-    if today_str in event_dates:
-        reasons.append(_WHY_EVENT.format(today=today_str))
+    # ── 3. Event calendar (block if event today OR tomorrow) ─────────────
+    today_str    = date.today().isoformat()
+    tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
+    if today_str in event_dates or tomorrow_str in event_dates:
+        event_ref = today_str if today_str in event_dates else tomorrow_str
+        reasons.append(_WHY_EVENT.format(today=event_ref))
 
     # ── 4. Extreme curve distortion ──────────────────────────────────────
     if abs(curve_diff) >= CURVE_EXTREME_PTS:

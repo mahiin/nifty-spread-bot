@@ -38,22 +38,31 @@ try:
 except ImportError:
     BROKER_AVAILABLE = False
 
-REGION    = os.environ.get("AWS_REGION_NAME",        "ap-south-1")
-SIG_TABLE = os.environ.get("DYNAMODB_SIGNALS_TABLE", "nifty_spread_signals")
-POS_TABLE = os.environ.get("POSITIONS_TABLE",        "nifty_positions")
-PNL_TABLE = os.environ.get("PNL_TABLE",              "nifty_pnl")
-ORD_TABLE = os.environ.get("ORDERS_TABLE",           "nifty_orders")
-CFG_TABLE = os.environ.get("CONFIG_TABLE",           "nifty_config")
-MODE      = os.environ.get("MODE",                   "PAPER")
-IST       = pytz.timezone("Asia/Kolkata")
+REGION           = os.environ.get("AWS_REGION_NAME",        "ap-south-1")
+SIG_TABLE        = os.environ.get("DYNAMODB_SIGNALS_TABLE", "nifty_spread_signals")
+POS_TABLE        = os.environ.get("POSITIONS_TABLE",        "nifty_positions")
+PNL_TABLE        = os.environ.get("PNL_TABLE",              "nifty_pnl")
+ORD_TABLE        = os.environ.get("ORDERS_TABLE",           "nifty_orders")
+CFG_TABLE        = os.environ.get("CONFIG_TABLE",           "nifty_config")
+MODE             = os.environ.get("MODE",                   "PAPER")
+IST              = pytz.timezone("Asia/Kolkata")
+DASHBOARD_SECRET = os.environ.get("DASHBOARD_SECRET",       "")
 
 ddb = boto3.resource("dynamodb", region_name=REGION)
 
 CORS = {
     "Access-Control-Allow-Origin":  "*",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type,x-dashboard-token",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
 }
+
+
+def _verify_token(event) -> bool:
+    """Check x-dashboard-token header. If DASHBOARD_SECRET is empty, auth is open."""
+    if not DASHBOARD_SECRET:
+        return True  # auth not configured — backward compat
+    token = (event.get("headers") or {}).get("x-dashboard-token", "")
+    return token == DASHBOARD_SECRET
 
 
 def _resp(body, code=200):
@@ -178,6 +187,21 @@ def _get_effective_mode() -> str:
         return MODE
 
 
+def _check_daily_loss_limit() -> tuple[bool, str]:
+    """Returns (ok, reason). ok=False means daily loss limit hit."""
+    try:
+        cfg_resp = ddb.Table(CFG_TABLE).get_item(Key={"config_key": "MAX_DAILY_LOSS"})
+        max_loss = float(cfg_resp.get("Item", {}).get("config_value", 5000))
+        today    = date.today().isoformat()
+        pnl_resp = ddb.Table(PNL_TABLE).get_item(Key={"date": today})
+        pnl      = float(pnl_resp.get("Item", {}).get("realised_pnl", 0) or 0)
+        if pnl <= -max_loss:
+            return False, f"Daily loss limit ₹{max_loss:,.0f} reached (current: ₹{pnl:,.0f})"
+    except Exception:
+        pass
+    return True, ""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  ORDER placement
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,6 +233,10 @@ def place_butterfly_order(body: dict) -> dict:
     body: {type, direction, near_symbol, next_symbol, far_symbol, qty_per_leg, product}
     direction: SELL_BUTTERFLY | BUY_BUTTERFLY
     """
+    ok, reason = _check_daily_loss_limit()
+    if not ok:
+        raise ValueError(reason)
+
     direction  = body["direction"]
     near       = body["near_symbol"]
     nxt        = body["next_symbol"]
@@ -242,13 +270,102 @@ def place_butterfly_order(body: dict) -> dict:
 
 def place_single_order(body: dict) -> dict:
     """body: {tradingsymbol, exchange, transaction_type, quantity, order_type, price, product, tag}"""
+    ok, reason = _check_daily_loss_limit()
+    if not ok:
+        raise ValueError(reason)
+
     broker = get_broker() if BROKER_AVAILABLE else None
     oid = _safe_place(broker, body)
     return {"order_id": oid}
 
 
+def _get_latest_curve_diff() -> float:
+    """Fetch curve_diff from the most recent signal record."""
+    try:
+        resp = ddb.Table(SIG_TABLE).query(
+            IndexName="signal-by-time-index",
+            KeyConditionExpression=Key("pk").eq("SIGNAL"),
+            ScanIndexForward=False,
+            Limit=1,
+            ProjectionExpression="curve_diff",
+        )
+        items = resp.get("Items", [])
+        if items:
+            return float(items[0].get("curve_diff", 0))
+    except Exception:
+        pass
+    return 0.0
+
+
+def _write_pnl_api(pnl: float) -> None:
+    """Add pnl to today's running total in nifty_pnl table."""
+    today = date.today().isoformat()
+    try:
+        ddb.Table(PNL_TABLE).update_item(
+            Key={"date": today},
+            UpdateExpression=(
+                "SET realised_pnl = if_not_exists(realised_pnl, :zero) + :p, "
+                "trades = if_not_exists(trades, :zero) + :one, "
+                "#m = :mode"
+            ),
+            ExpressionAttributeNames={"#m": "mode"},
+            ExpressionAttributeValues={
+                ":p":    round(pnl, 2),
+                ":zero": 0,
+                ":one":  1,
+                ":mode": _get_effective_mode(),
+            },
+        )
+    except Exception as e:
+        print(f"[dashboard_api] Could not write P&L: {e}")
+
+
+def _build_close_legs(trade_type: str, pos: dict, qty: int) -> list:
+    """Return [(symbol, side, qty), ...] for closing a position."""
+    near = pos.get("near_symbol", "")
+    nxt  = pos.get("next_symbol", "")
+    far  = pos.get("far_symbol",  "")
+    call = pos.get("call_symbol", "")
+    put  = pos.get("put_symbol",  "")
+
+    if "SELL_BUTTERFLY" in trade_type:
+        return [(near, "SELL", qty), (nxt, "BUY", qty * 2), (far, "SELL", qty)]
+    if "BUY_BUTTERFLY" in trade_type:
+        return [(near, "BUY", qty), (nxt, "SELL", qty * 2), (far, "BUY", qty)]
+    if "BUY_FUT_SELL_CALL_BUY_PUT" in trade_type:
+        return [(near, "SELL", qty), (call, "BUY", qty), (put, "SELL", qty)]
+    if "SELL_FUT_BUY_CALL_SELL_PUT" in trade_type:
+        return [(near, "BUY", qty), (call, "SELL", qty), (put, "BUY", qty)]
+    # Intraday options (SELL_STRADDLE, BUY_STRADDLE, SELL_STRANGLE, BUY_STRANGLE, BUY_CE, BUY_PE)
+    is_buy = trade_type in ("BUY_STRADDLE", "BUY_STRANGLE", "BUY_CE", "BUY_PE")
+    close_action = "SELL" if is_buy else "BUY"
+    legs = []
+    if trade_type in ("BUY_STRADDLE", "SELL_STRADDLE", "BUY_STRANGLE", "SELL_STRANGLE"):
+        if call: legs.append((call, close_action, qty))
+        if put:  legs.append((put,  close_action, qty))
+    elif trade_type == "BUY_CE" and call:
+        legs.append((call, close_action, qty))
+    elif trade_type == "BUY_PE" and put:
+        legs.append((put,  close_action, qty))
+    return legs
+
+
+def _calc_close_pnl(trade_type: str, pos: dict, exit_curve_diff: float) -> float:
+    """Estimate P&L for manual close. Returns 0 for intraday (no reliable exit premium)."""
+    if "BUTTERFLY" in trade_type:
+        entry_diff = float(pos.get("entry_curve_diff", 0))
+        qty        = int(pos.get("qty", 75))
+        diff_change = entry_diff - exit_curve_diff
+        if "SELL_BUTTERFLY" in trade_type:
+            return round(diff_change * qty, 2)
+        if "BUY_BUTTERFLY" in trade_type:
+            return round(-diff_change * qty, 2)
+    # For arb / intraday — use exit_pnl provided by caller or 0
+    return float(pos.get("_exit_pnl_override", 0))
+
+
 def close_position(body: dict) -> dict:
-    """Reverse all legs of an open position."""
+    """Reverse all legs of an open position and record P&L."""
     position_id = body.get("position_id")
     if not position_id:
         raise ValueError("position_id required")
@@ -259,17 +376,10 @@ def close_position(body: dict) -> dict:
         raise ValueError(f"Position {position_id} not found")
 
     trade_type = pos.get("trade_type", "")
-    near       = pos.get("near_symbol", "")
-    nxt        = pos.get("next_symbol", "")
-    far        = pos.get("far_symbol",  "")
     qty        = int(pos.get("qty", 75))
 
-    # Determine reverse legs
-    if "SELL_BUTTERFLY" in trade_type:
-        legs = [(near, "SELL", qty), (nxt, "BUY", qty * 2), (far, "SELL", qty)]
-    elif "BUY_BUTTERFLY" in trade_type:
-        legs = [(near, "BUY", qty), (nxt, "SELL", qty * 2), (far, "BUY", qty)]
-    else:
+    legs = _build_close_legs(trade_type, pos, qty)
+    if not legs:
         raise ValueError(f"Cannot auto-close trade_type: {trade_type}")
 
     broker    = get_broker() if BROKER_AVAILABLE else None
@@ -290,15 +400,35 @@ def close_position(body: dict) -> dict:
         oid = _safe_place(broker, params)
         order_ids.append(oid)
 
-    # Mark position closed
+    # ── P&L calculation ───────────────────────────────────────────────────────
+    # Caller may pass exit_curve_diff or exit_pnl directly in the request body
+    exit_curve_diff = float(body.get("exit_curve_diff") or _get_latest_curve_diff())
+    if "exit_pnl" in body:
+        pnl = float(body["exit_pnl"])
+    else:
+        pos["_exit_pnl_override"] = 0
+        pnl = _calc_close_pnl(trade_type, pos, exit_curve_diff)
+
+    # ── Mark position closed with exit metadata ───────────────────────────────
+    now_ts = datetime.now(IST).isoformat()
     ddb.Table(POS_TABLE).update_item(
         Key={"position_id": position_id},
-        UpdateExpression="SET #s = :s",
+        UpdateExpression=(
+            "SET #s = :s, exit_pnl = :p, exit_reason = :r, exit_timestamp = :t"
+        ),
         ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={":s": "CLOSED"},
+        ExpressionAttributeValues={
+            ":s": "CLOSED",
+            ":p": str(round(pnl, 2)),
+            ":r": "MANUAL_CLOSE",
+            ":t": now_ts,
+        },
     )
 
-    return {"order_ids": order_ids, "order_count": len(order_ids)}
+    # ── Write P&L to daily summary ────────────────────────────────────────────
+    _write_pnl_api(pnl)
+
+    return {"order_ids": order_ids, "order_count": len(order_ids), "pnl": pnl}
 
 
 def get_daily_plan() -> dict:
@@ -380,6 +510,11 @@ def lambda_handler(event, context):
 
     if method == "OPTIONS":
         return _resp({})
+
+    # Auth check — /health is exempt so AWS monitoring works
+    if not path.endswith("/health") and not _verify_token(event):
+        return {"statusCode": 401, "headers": CORS,
+                "body": json.dumps({"error": "Unauthorized"})}
 
     try:
         # ── Read endpoints ────────────────────────────────────────────────────

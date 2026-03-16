@@ -57,13 +57,19 @@ from arbitrage_engine    import check_parity
 from alerter             import (send_telegram, send_regime_alert, publish_to_sns,
                                   send_exit_alert, send_error_alert,
                                   send_intraday_alert, send_intraday_execution_alert,
-                                  send_options_exit_alert)
+                                  send_options_exit_alert, send_premarket_report,
+                                  send_margin_alert, send_delta_alert)
 from position_monitor    import check_and_exit_positions, check_and_exit_options_positions
 from regime_guard        import check_trade_safety, get_india_vix
 from regime_detector     import detect_regime
 from volatility_engine   import compute_volatility_signal
 from strategy_router     import build_daily_plan
 from intraday_advisor    import build_intraday_plan
+from fii_dii_engine      import (fetch_fii_dii, get_fii_dii_signal,
+                                  fetch_fii_futures, get_fii_futures_signal)
+from option_chain_engine import fetch_option_chain, get_iron_condor_strikes
+from iron_condor         import build_iron_condor_plan, ic_entry_allowed
+from greeks_engine       import compute_position_greeks
 
 # ─── AWS ───────────────────────────────────────────────────────────────────
 REGION   = os.environ.get("AWS_REGION_NAME", "ap-south-1")
@@ -286,6 +292,102 @@ def _get_prev_vix() -> float:
     return 0.0
 
 
+def _get_day_of_week() -> int:
+    """Return current IST day of week: 0=Mon … 6=Sun."""
+    return datetime.now(IST).weekday()
+
+
+def _premarket_report_needed() -> bool:
+    """
+    Return True only during 8:45–9:05 AM IST window AND
+    today's pre-market report hasn't been sent yet.
+    """
+    now = datetime.now(IST)
+    if not (8 * 60 + 45 <= now.hour * 60 + now.minute <= 9 * 60 + 5):
+        return False
+    try:
+        resp = cfg_tbl.get_item(Key={"config_key": "PREMARKET_SENT_DATE"})
+        last = resp.get("Item", {}).get("config_value", "")
+        return last != now.strftime("%Y-%m-%d")
+    except Exception:
+        return True
+
+
+def _mark_premarket_sent() -> None:
+    try:
+        cfg_tbl.put_item(Item={
+            "config_key":   "PREMARKET_SENT_DATE",
+            "config_value": datetime.now(IST).strftime("%Y-%m-%d"),
+        })
+    except Exception:
+        pass
+
+
+def _paper_trade_arb(record: dict) -> None:
+    """
+    Record a paper arb position in DynamoDB when MODE=PAPER and arb signal is strong.
+    Skips if an open ARB position already exists today.
+    """
+    try:
+        from boto3.dynamodb.conditions import Attr
+        pos_tbl = ddb.Table(os.environ.get("POSITIONS_TABLE", "nifty_positions"))
+        existing = pos_tbl.scan(
+            FilterExpression=(
+                Attr("status").eq("OPEN") & Attr("strategy_type").eq("ARB")
+            ),
+            Select="COUNT",
+        )
+        if existing.get("Count", 0) > 0:
+            print("[arb] Paper arb position already open — skipping")
+            return
+
+        ts     = datetime.now(IST).isoformat()
+        pos_id = f"ARB_{datetime.now(IST).strftime('%Y%m%d_%H%M%S')}"
+        mispricing = float(record.get("arb_mispricing", 0))
+        lot_size   = int(os.environ.get("LOT_SIZE", "75"))
+        signal     = record.get("arbitrage_signal", "")
+
+        # SL: mispricing widens by 12pts; Target: 80% reversion
+        sl_level     = round(abs(mispricing) + 12, 2)
+        target_level = round(abs(mispricing) * 0.2, 2)
+
+        order_ids = [
+            f"PAPER_FUT_{record.get('near_symbol','')}",
+            f"PAPER_CALL_{record.get('call_symbol','')}",
+            f"PAPER_PUT_{record.get('put_symbol','')}",
+        ]
+        for oid in order_ids:
+            print(f"[PAPER ARB] {signal} — {oid}")
+
+        pos_tbl.put_item(Item={
+            "position_id":      pos_id,
+            "timestamp":        ts,
+            "strategy_type":    "ARB",
+            "trade_type":       signal,
+            "status":           "OPEN",
+            "mode":             "PAPER",
+            "entry_mispricing": str(mispricing),
+            "sl_level":         str(sl_level),
+            "target_level":     str(target_level),
+            "near_symbol":      record.get("near_symbol", ""),
+            "call_symbol":      record.get("call_symbol", ""),
+            "put_symbol":       record.get("put_symbol", ""),
+            "arb_strike":       record.get("arb_strike", ""),
+            "arb_call_price":   record.get("arb_call_price", ""),
+            "arb_put_price":    record.get("arb_put_price", ""),
+            "arb_synthetic_fut":record.get("arb_synthetic_fut", ""),
+            "arb_actual_fut":   record.get("arb_actual_fut", ""),
+            "qty":              str(lot_size),
+            "hard_exit_time":   "15:25",   # force close before market end
+            "order_ids":        json.dumps(order_ids),
+            "zscore":           record.get("zscore", ""),
+            "india_vix":        record.get("india_vix", ""),
+        })
+        print(f"[arb] Paper position created: {pos_id}")
+    except Exception as exc:
+        print(f"[arb] Paper trade record failed: {exc}")
+
+
 def lambda_handler(event, context):
     # Load config first so we can check holidays before doing anything else
     cfg = _load_config()
@@ -302,7 +404,49 @@ def lambda_handler(event, context):
         return {"statusCode": 200, "body": "Market closed"}
 
     if past_entry_cutoff("14:30"):
-        return {"statusCode": 200, "body": "Past entry cutoff"}
+        # Entry window closed — but still run position monitors so hard-exit
+        # at 1:30 PM is guaranteed to fire even if earlier scans had errors.
+        # Runs a minimal broker+exit loop until 15:30 market close.
+        if not past_entry_cutoff("15:30"):
+            try:
+                _broker = get_broker()
+                # Spread / arb positions (target / SL / DTE)
+                _cdiff  = 0.0
+                _dte    = 30
+                try:
+                    _fut = get_active_futures(_broker, UNDERLYING)
+                    from spread_engine import compute_spreads, days_to_expiry
+                    _q   = _broker.get_quote([
+                        f"NFO:{_fut['near_token']}",
+                        f"NFO:{_fut['next_token']}",
+                        f"NFO:{_fut['far_token']}",
+                    ])
+                    _n   = float(_q[f"NFO:{_fut['near']}"]["ltp"])
+                    _nx  = float(_q[f"NFO:{_fut['next']}"]["ltp"])
+                    _f   = float(_q[f"NFO:{_fut['far']}"]["ltp"])
+                    _cdiff = compute_spreads(_n, _nx, _f)["curve_diff"]
+                    _dte   = days_to_expiry(_fut["near_expiry"])
+                except Exception:
+                    pass
+                _sprd_exits = check_and_exit_positions(_broker, _cdiff, _dte)
+                if _sprd_exits:
+                    send_exit_alert(_sprd_exits)
+
+                # Intraday options positions (hard exit 1:30 PM)
+                try:
+                    _arb_mod = __import__("arbitrage_engine")
+                    _spot    = float(list(_q.values())[0].get("ltp", 0)) if '_q' in dir() else 0
+                    _arb     = _arb_mod.check_parity(_broker, _fut, _spot, _q) if _spot else {}
+                    _cprice  = float(_arb.get("call_price", 0))
+                    _pprice  = float(_arb.get("put_price",  0))
+                except Exception:
+                    _cprice, _pprice = 0.0, 0.0
+                _opt_exits = check_and_exit_options_positions(_broker, _cprice + _pprice)
+                if _opt_exits:
+                    send_options_exit_alert(_opt_exits, mode=cfg.get("MODE", "PAPER"))
+            except Exception as _e:
+                print(f"[post-cutoff monitor] Error: {_e}")
+        return {"statusCode": 200, "body": "Past entry cutoff — monitors ran"}
 
     # cfg already loaded above for holiday check — use it directly
     ZSCORE_THRESH = float(cfg["ZSCORE_THRESHOLD"])
@@ -313,6 +457,19 @@ def lambda_handler(event, context):
 
     try:
         broker  = get_broker()
+
+        # ── Margin utilization alert (fires once/hour if >60% used) ──────
+        try:
+            funds = broker.get_funds()
+            available_margin = float(funds.get("availablecash", funds.get("net", 0)))
+            CAPITAL_CHK = float(cfg.get("TRADING_CAPITAL", os.environ.get("TRADING_CAPITAL", "500000")))
+            used_margin  = CAPITAL_CHK - available_margin
+            margin_pct   = (used_margin / CAPITAL_CHK * 100) if CAPITAL_CHK > 0 else 0
+            if margin_pct > 60:
+                send_margin_alert(margin_pct, available_margin, CAPITAL_CHK)
+        except Exception:
+            pass
+
         futures = get_active_futures(broker, UNDERLYING)
 
         # ── Live quotes (pass token IDs; response keyed by symbol) ─────────
@@ -374,6 +531,16 @@ def lambda_handler(event, context):
             elif zscore < -ZSCORE_THRESH:
                 spread_signal = "BUY_BUTTERFLY"
 
+        # ── Synthetic arbitrage (suppressed on HALT) ──────────────────────
+        if safety["safe"]:
+            arb = check_parity(broker, futures, spot_price, quotes)
+        else:
+            arb = {
+                "arbitrage_signal": "NONE", "arb_mispricing": 0,
+                "arb_stoploss": 0, "arb_target": 0,
+                "call_symbol": "", "put_symbol": "",
+            }
+
         # ── Signal strength & sizing ──────────────────────────────────────
         strength = signal_strength(
             zscore,
@@ -397,16 +564,6 @@ def lambda_handler(event, context):
             if spread_signal != "NONE"
             else {"stoploss_diff": 0, "target_diff": 0}
         )
-
-        # ── Synthetic arbitrage (suppressed on HALT) ──────────────────────
-        if safety["safe"]:
-            arb = check_parity(broker, futures, spot_price, quotes)
-        else:
-            arb = {
-                "arbitrage_signal": "NONE", "arb_mispricing": 0,
-                "arb_stoploss": 0, "arb_target": 0,
-                "call_symbol": "", "put_symbol": "",
-            }
 
         # ── Position Monitor (exit logic runs every scan) ─────────────────
         # Must run before building the record so exit events can be alerted
@@ -447,18 +604,125 @@ def lambda_handler(event, context):
             lot_size    = LOT_SIZE,
         )
 
+        # ── Day-of-week + Institutional Flow (FII/DII) ───────────────────
+        day_of_week  = _get_day_of_week()
+        fii_data     = fetch_fii_dii()
+        fii_signal   = get_fii_dii_signal(fii_data)
+        # FII F&O: index futures net long/short — the gold standard signal
+        fii_fut_data = fetch_fii_futures()
+        fii_fut_sig  = get_fii_futures_signal(fii_fut_data)
+
+        # ── Option Chain: PCR, Max Pain, OI Walls (15-min cache) ─────────
+        chain_data  = fetch_option_chain()
+        pcr         = float(chain_data.get("pcr", 1.0))
+        pcr_signal  = chain_data.get("pcr_signal", "PCR_NEUTRAL")
+        max_pain    = int(chain_data.get("max_pain", 0))
+        call_wall   = int(chain_data.get("call_wall", 0))
+        put_wall    = int(chain_data.get("put_wall", 0))
+        iv_skew     = float(chain_data.get("iv_skew", 0.0))
+        iv_skew_sig = chain_data.get("iv_skew_signal", "SKEW_NEUTRAL")
+
+        # ── Iron Condor Plan (Mon/Tue when conditions met) ────────────────
+        iron_condor_plan = None
+        ic_ok, ic_reason = ic_entry_allowed(vix or 0.0, pcr, dte, day_of_week, event_dates)
+        if ic_ok and safety["safe"]:
+            try:
+                iron_condor_plan = build_iron_condor_plan(
+                    broker, spot_price, vix or 0.0, dte,
+                    futures["near_expiry"], pcr, max_pain, LOT_SIZE,
+                )
+                print(f"[IC] Plan built: net_premium={iron_condor_plan.get('net_premium')} "
+                      f"SL=₹{iron_condor_plan.get('sl_inr')} Target=₹{iron_condor_plan.get('target_inr')}")
+            except Exception as ic_err:
+                print(f"[IC] Plan build failed: {ic_err}")
+                iron_condor_plan = None
+        else:
+            print(f"[IC] Entry blocked: {ic_reason}")
+
+        # ── Pre-market Report (fires once at 8:45–9:05 AM IST) ───────────
+        if _premarket_report_needed():
+            DAY_LABELS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            # Determine recommended strategy for the day (plain text)
+            if not safety["safe"]:
+                _rec_strat = "WAIT — regime HALT"
+                _strat_note = safety.get("reasons", ["Adverse conditions"])[0]
+            elif ic_ok and iron_condor_plan:
+                _rec_strat = "IRON CONDOR"
+                _strat_note = (
+                    f"Sell {iron_condor_plan.get('short_call')}CE + "
+                    f"Buy {iron_condor_plan.get('long_call')}CE / "
+                    f"Sell {iron_condor_plan.get('short_put')}PE + "
+                    f"Buy {iron_condor_plan.get('long_put')}PE  "
+                    f"| Net premium ≈ ₹{iron_condor_plan.get('net_premium', 0):.0f}/share"
+                )
+            elif day_of_week == 3:
+                _rec_strat = "WAIT — expiry day, close positions by 12:30 PM"
+                _strat_note = ""
+            else:
+                _rec_strat = ic_reason  # explain why IC not viable
+                _strat_note = ""
+
+            premarket_report = {
+                "date":               datetime.now(IST).strftime("%Y-%m-%d"),
+                "day_label":          DAY_LABELS[day_of_week],
+                "day_of_week":        day_of_week,
+                "spot":               spot_price,
+                "vix":                vix or 0.0,
+                # FII/DII cash market
+                "fii_signal":         fii_signal,
+                "fii_net_cr":         fii_data.get("fii_net_cr", 0),
+                "dii_net_cr":         fii_data.get("dii_net_cr", 0),
+                "fii_data_date":      fii_data.get("data_date", ""),
+                # FII F&O (index futures positioning — gold standard)
+                "fii_fut_signal":     fii_fut_sig,
+                "fii_fut_net":        int(fii_fut_data.get("fii_fut_net", 0)),
+                "fii_opt_pcr":        fii_fut_data.get("fii_opt_pcr", 1.0),
+                # Option chain
+                "pcr":                pcr,
+                "pcr_signal":         pcr_signal,
+                "max_pain":           max_pain,
+                "call_wall":          call_wall,
+                "put_wall":           put_wall,
+                "atm_iv":             float(chain_data.get("atm_iv", 0.0)),
+                "iv_skew":            iv_skew,
+                "iv_skew_signal":     iv_skew_sig,
+                # Strategy
+                "recommended_strategy": _rec_strat,
+                "strategy_note":      _strat_note,
+                # Events — convert list to comma-separated string
+                "events_today":       ", ".join(event_dates) if event_dates else "",
+                # Context
+                "regime":             safety["regime"],
+                "iron_condor":        iron_condor_plan,
+            }
+            try:
+                send_premarket_report(premarket_report)
+                _mark_premarket_sent()
+                print("[premarket] Report sent")
+            except Exception as pm_err:
+                print(f"[premarket] Report failed: {pm_err}")
+
         # ── Strategy Router – Daily Plan ──────────────────────────────────
         daily_plan = build_daily_plan(
-            safety        = safety,
-            regime        = regime_data,
-            vol           = vol_data_iv,
-            arb           = arb,
-            spread_signal = spread_signal,
-            strength      = strength,
-            futures       = futures,
-            qty           = qty,
-            lot_size      = LOT_SIZE,
-            min_strength  = MIN_STRENGTH,
+            safety           = safety,
+            regime           = regime_data,
+            vol              = vol_data_iv,
+            arb              = arb,
+            spread_signal    = spread_signal,
+            strength         = strength,
+            futures          = futures,
+            qty              = qty,
+            lot_size         = LOT_SIZE,
+            min_strength     = MIN_STRENGTH,
+            fii_signal       = fii_signal,
+            fii_fut_signal   = fii_fut_sig,
+            pcr              = pcr,
+            pcr_signal       = pcr_signal,
+            max_pain         = max_pain,
+            iron_condor_plan = iron_condor_plan,
+            day_of_week      = day_of_week,
+            dte              = dte,
+            event_dates      = event_dates,
         )
         _store_daily_plan(daily_plan)
 
@@ -504,6 +768,23 @@ def lambda_handler(event, context):
         if options_exits:
             send_options_exit_alert(options_exits, mode=cfg.get("MODE", "PAPER"))
 
+        # ── Portfolio Greeks (aggregate all open positions) ───────────────
+        try:
+            from position_monitor import _get_open_intraday_positions
+            open_positions   = _get_open_intraday_positions()
+            portfolio_greeks = compute_position_greeks(open_positions, spot_price, LOT_SIZE)
+            # Delta alert: fire if |per_lot_delta| > 0.3
+            if abs(portfolio_greeks.get("per_lot_delta", 0)) > 0.3:
+                send_delta_alert(portfolio_greeks["per_lot_delta"], open_positions)
+            # Persist to DynamoDB config for dashboard /risk endpoint
+            cfg_tbl.put_item(Item={
+                "config_key":   "PORTFOLIO_GREEKS",
+                "config_value": json.dumps(portfolio_greeks),
+            })
+        except Exception as greeks_err:
+            print(f"[greeks] Error computing portfolio Greeks: {greeks_err}")
+            portfolio_greeks = {}
+
         # ── Build DynamoDB record ─────────────────────────────────────────
         ts = datetime.now(IST).isoformat()
         record = {
@@ -531,15 +812,22 @@ def lambda_handler(event, context):
             "next_oi":          str(oi_data["next_oi"]),
             "oi_diff":          str(oi_data["oi_diff"]),
             "rollover_signal":  str(oi_data["rollover_signal"]),
+            "rollover_pct":     str(oi_data["rollover_pct"]),
+            "rollover_strong":  str(oi_data["rollover_strong"]),
             "vol_ratio":        str(vol_data["vol_ratio"]),
             "volume_signal":    str(vol_data["volume_signal"]),
             # ── Arbitrage ─────────────────────────────────────────────────
-            "arbitrage_signal": arb.get("arbitrage_signal", "NONE"),
-            "arb_mispricing":   str(arb.get("arb_mispricing", 0)),
-            "arb_stoploss":     str(arb.get("arb_stoploss", 0)),
-            "arb_target":       str(arb.get("arb_target", 0)),
-            "call_symbol":      arb.get("call_symbol", ""),
-            "put_symbol":       arb.get("put_symbol", ""),
+            "arbitrage_signal":  arb.get("arbitrage_signal", "NONE"),
+            "arb_mispricing":    str(arb.get("arb_mispricing", 0)),
+            "arb_stoploss":      str(arb.get("arb_stoploss", 0)),
+            "arb_target":        str(arb.get("arb_target", 0)),
+            "call_symbol":       arb.get("call_symbol", ""),
+            "put_symbol":        arb.get("put_symbol", ""),
+            "arb_strike":        str(arb.get("strike", 0)),
+            "arb_call_price":    str(arb.get("call_price", 0)),
+            "arb_put_price":     str(arb.get("put_price", 0)),
+            "arb_synthetic_fut": str(arb.get("synthetic_future", 0)),
+            "arb_actual_fut":    str(arb.get("actual_future", 0)),
             # ── Regime Guard ──────────────────────────────────────────────
             "india_vix":        str(round(vix, 2)) if vix else "0",
             "vix_level":        safety["vix_level"],
@@ -560,9 +848,30 @@ def lambda_handler(event, context):
             "straddle_premium": str(vol_data_iv["straddle_premium"]),
             "breakeven_upper":  str(vol_data_iv["breakeven_upper"]),
             "breakeven_lower":  str(vol_data_iv["breakeven_lower"]),
+            # ── FII/DII cash market ───────────────────────────────────────
+            "fii_signal":       fii_signal,
+            "fii_net_cr":       str(fii_data.get("fii_net_cr", 0)),
+            "dii_net_cr":       str(fii_data.get("dii_net_cr", 0)),
+            # ── FII F&O futures positioning ───────────────────────────────
+            "fii_fut_signal":   fii_fut_sig,
+            "fii_fut_net":      str(fii_fut_data.get("fii_fut_net", 0)),
+            "fii_fut_long":     str(fii_fut_data.get("fii_fut_long", 0)),
+            "fii_fut_short":    str(fii_fut_data.get("fii_fut_short", 0)),
+            "fii_opt_pcr":      str(fii_fut_data.get("fii_opt_pcr", 1.0)),
+            "pcr":              str(round(pcr, 3)),
+            "pcr_signal":       pcr_signal,
+            "max_pain":         str(max_pain),
+            "call_wall":        str(call_wall),
+            "put_wall":         str(put_wall),
+            "iv_skew":          str(iv_skew),
+            "iv_skew_signal":   iv_skew_sig,
             # ── Daily Plan (summary) ──────────────────────────────────────
             "daily_strategy":   daily_plan["strategy"],
             "daily_plan_legs":  daily_plan["legs_text"],
+            # ── Portfolio Greeks ──────────────────────────────────────────
+            "total_delta":      str(portfolio_greeks.get("total_delta", 0)),
+            "total_theta_inr":  str(portfolio_greeks.get("total_theta_inr", 0)),
+            "total_vega_inr":   str(portfolio_greeks.get("total_vega_inr", 0)),
         }
 
         # ── Persist signal ────────────────────────────────────────────────
@@ -577,13 +886,27 @@ def lambda_handler(event, context):
                 _record_alert(record)
             return {"statusCode": 200, "body": json.dumps(record)}
 
+        # Arb alert only fires when mispricing is meaningfully above threshold (1.5×)
+        # to avoid spamming on borderline signals (e.g., 15.x pts barely over 15pt threshold)
+        _arb_threshold = float(cfg.get("ARBITRAGE_THRESHOLD", os.environ.get("ARBITRAGE_THRESHOLD", "15")))
+        MIN_ARB_ALERT = float(cfg.get("MIN_ARB_ALERT_PTS", str(_arb_threshold * 1.5)))
+        arb_mispricing_val = abs(float(arb.get("arb_mispricing", 0)))
+        arb_tradeable = (
+            arb.get("arbitrage_signal", "NONE") not in ("NONE", "")
+            and arb_mispricing_val >= MIN_ARB_ALERT
+            and safety["safe"]   # no arb alerts on HALT
+        )
         has_signal = (
             spread_signal != "NONE" and strength >= MIN_STRENGTH
-        ) or arb.get("arbitrage_signal", "NONE") not in ("NONE", "")
+        ) or arb_tradeable
 
         if has_signal and _should_alert(record, COOLDOWN):
             send_telegram(record)
             _record_alert(record)
+            # Paper-execute arb signal when in PAPER mode and auto-execute is on
+            MODE = cfg.get("MODE", os.environ.get("MODE", "PAPER"))
+            if arb_tradeable and INTRADAY_AUTO_EXECUTE and MODE == "PAPER":
+                _paper_trade_arb(record)
             if cfg.get("SNS_EXECUTE_ENABLED", "false").lower() == "true":
                 publish_to_sns(record)
 

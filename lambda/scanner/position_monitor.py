@@ -45,6 +45,20 @@ INTRADAY_TYPES = {
 }
 
 
+def _dynamic_sl_multiplier() -> float:
+    """
+    Time-based stop-loss tightening for intraday / SELL positions.
+    Before 11 AM: full SL. 11 AM–12 PM: 75%. After 12 PM: 50%.
+    """
+    now  = datetime.now(IST)
+    mins = now.hour * 60 + now.minute
+    if mins < 11 * 60:
+        return 1.00
+    if mins < 12 * 60:
+        return 0.75
+    return 0.50
+
+
 def check_and_exit_options_positions(
     broker,
     current_atm_premium: float,   # live call_ltp + put_ltp from volatility engine
@@ -180,6 +194,18 @@ def _exit_reason(pos: dict, current_diff: float, dte: int) -> Optional[str]:
         if sl_diff > 0 and current_diff <= sl_diff:
             return f"STOP_LOSS (diff={current_diff:.1f} ≤ SL={sl_diff:.1f})"
 
+    # ARB position: exit based on mispricing SL/target stored at entry
+    if pos.get("strategy_type") == "ARB":
+        entry_mispricing = abs(float(pos.get("entry_mispricing", 0)))
+        sl_level         = float(pos.get("sl_level",     0))
+        target_level     = float(pos.get("target_level", 0))
+        # Use current_diff as a proxy for current mispricing (latest scan value)
+        current_mispricing = abs(current_diff)
+        if target_level > 0 and current_mispricing <= target_level:
+            return f"TARGET_HIT (arb mispricing {current_mispricing:.1f} ≤ {target_level:.1f})"
+        if sl_level > 0 and current_mispricing >= sl_level:
+            return f"STOP_LOSS (arb mispricing {current_mispricing:.1f} ≥ SL={sl_level:.1f})"
+
     # Time-based hard exit (for arb/intraday-arb positions tagged with hard_exit_time)
     hard_exit = pos.get("hard_exit_time", "")
     if hard_exit:
@@ -277,17 +303,28 @@ def _execute_close(broker, pos: dict) -> list[str]:
 
 def _calc_pnl(pos: dict, exit_diff: float) -> float:
     """
-    Approximate P&L for a calendar spread position.
+    Approximate P&L for a calendar spread or arb position.
 
     Calendar spread P&L ≈ (entry_curve_diff − exit_curve_diff) × lot_size
     for SELL_BUTTERFLY (we benefit from convergence).
     Flip sign for BUY_BUTTERFLY.
 
+    Arb P&L ≈ (entry_mispricing − exit_mispricing) × lot_size
+    (we profit when mispricing converges to zero).
+
     This is an approximation — actual P&L depends on exact fill prices.
     """
-    entry_diff = float(pos.get("entry_curve_diff", 0))
     qty        = int(pos.get("qty", LOT_SIZE))
     trade_type = pos.get("trade_type", "")
+
+    # ARB position: P&L based on mispricing change
+    if pos.get("strategy_type") == "ARB":
+        entry_mispricing = abs(float(pos.get("entry_mispricing", 0)))
+        exit_mispricing  = abs(exit_diff)   # proxy: current curve_diff
+        raw_pnl = (entry_mispricing - exit_mispricing) * qty
+        return round(raw_pnl, 2)
+
+    entry_diff = float(pos.get("entry_curve_diff", 0))
 
     diff_change = entry_diff - exit_diff  # positive = convergence
 
@@ -352,10 +389,12 @@ def _options_exit_reason(
             return f"STOP_LOSS (premium {change_pct*100:.1f}% ≤ -{sl_pct*100:.0f}%)"
     else:
         # SELL: profit when premium falls, loss when it rises
+        # Apply time-based SL tightening: after 11 AM reduce effective SL
+        effective_sl = sl_pct * _dynamic_sl_multiplier()
         if change_pct <= -target_pct:
             return f"TARGET_HIT (premium {change_pct*100:.1f}% ≤ -{target_pct*100:.0f}%)"
-        if change_pct >= sl_pct:
-            return f"STOP_LOSS (premium +{change_pct*100:.1f}% ≥ {sl_pct*100:.0f}%)"
+        if change_pct >= effective_sl:
+            return f"STOP_LOSS (premium +{change_pct*100:.1f}% ≥ {effective_sl*100:.0f}% dynamic SL)"
 
     return None
 

@@ -180,6 +180,30 @@ def _exit_reason(pos: dict, current_diff: float, dte: int) -> Optional[str]:
         if sl_diff > 0 and current_diff <= sl_diff:
             return f"STOP_LOSS (diff={current_diff:.1f} ≤ SL={sl_diff:.1f})"
 
+    # ARB position: exit based on mispricing SL/target stored at entry
+    if pos.get("strategy_type") == "ARB":
+        entry_mispricing = abs(float(pos.get("entry_mispricing", 0)))
+        sl_level         = float(pos.get("sl_level",     0))
+        target_level     = float(pos.get("target_level", 0))
+        # Use current_diff as a proxy for current mispricing (latest scan value)
+        current_mispricing = abs(current_diff)
+        if target_level > 0 and current_mispricing <= target_level:
+            return f"TARGET_HIT (arb mispricing {current_mispricing:.1f} ≤ {target_level:.1f})"
+        if sl_level > 0 and current_mispricing >= sl_level:
+            return f"STOP_LOSS (arb mispricing {current_mispricing:.1f} ≥ SL={sl_level:.1f})"
+
+    # Time-based hard exit (for arb/intraday-arb positions tagged with hard_exit_time)
+    hard_exit = pos.get("hard_exit_time", "")
+    if hard_exit:
+        now_ist = datetime.now(IST)
+        try:
+            h, m = map(int, hard_exit.split(":"))
+            cutoff = now_ist.replace(hour=h, minute=m, second=0, microsecond=0)
+            if now_ist >= cutoff:
+                return f"HARD_EXIT (past {hard_exit} IST cutoff)"
+        except Exception:
+            pass
+
     return None
 
 
@@ -265,17 +289,28 @@ def _execute_close(broker, pos: dict) -> list[str]:
 
 def _calc_pnl(pos: dict, exit_diff: float) -> float:
     """
-    Approximate P&L for a calendar spread position.
+    Approximate P&L for a calendar spread or arb position.
 
     Calendar spread P&L ≈ (entry_curve_diff − exit_curve_diff) × lot_size
     for SELL_BUTTERFLY (we benefit from convergence).
     Flip sign for BUY_BUTTERFLY.
 
+    Arb P&L ≈ (entry_mispricing − exit_mispricing) × lot_size
+    (we profit when mispricing converges to zero).
+
     This is an approximation — actual P&L depends on exact fill prices.
     """
-    entry_diff = float(pos.get("entry_curve_diff", 0))
     qty        = int(pos.get("qty", LOT_SIZE))
     trade_type = pos.get("trade_type", "")
+
+    # ARB position: P&L based on mispricing change
+    if pos.get("strategy_type") == "ARB":
+        entry_mispricing = abs(float(pos.get("entry_mispricing", 0)))
+        exit_mispricing  = abs(exit_diff)   # proxy: current curve_diff
+        raw_pnl = (entry_mispricing - exit_mispricing) * qty
+        return round(raw_pnl, 2)
+
+    entry_diff = float(pos.get("entry_curve_diff", 0))
 
     diff_change = entry_diff - exit_diff  # positive = convergence
 
@@ -453,9 +488,9 @@ def _write_pnl(pnl: float) -> None:
             ),
             ExpressionAttributeNames={"#m": "mode"},
             ExpressionAttributeValues={
-                ":p":    str(round(pnl, 2)),
-                ":zero": "0",
-                ":one":  "1",
+                ":p":    round(pnl, 2),
+                ":zero": 0,
+                ":one":  1,
                 ":mode": MODE,
             },
         )

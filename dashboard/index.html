@@ -455,6 +455,38 @@
 
 <!-- ══════════════════════════ POSITIONS ══════════════════════════ -->
 <div class="panel" id="tab-positions">
+  <!-- Portfolio Risk Summary Card -->
+  <div class="signal-box" id="risk-card" style="margin-bottom:16px;">
+    <h2>PORTFOLIO RISK</h2>
+    <div class="grid" style="grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap:10px;">
+      <div class="card" style="padding:10px;">
+        <div class="label">Net Delta</div>
+        <div class="value" id="risk-delta" style="font-size:18px;">–</div>
+        <div class="sub">per lot</div>
+      </div>
+      <div class="card" style="padding:10px;">
+        <div class="label">Theta / Day</div>
+        <div class="value" id="risk-theta" style="font-size:18px;">–</div>
+        <div class="sub">pts (–ve = earns)</div>
+      </div>
+      <div class="card" style="padding:10px;">
+        <div class="label">Vega / 1% IV</div>
+        <div class="value" id="risk-vega" style="font-size:18px;">–</div>
+        <div class="sub">pts change</div>
+      </div>
+      <div class="card" style="padding:10px;">
+        <div class="label">Margin Used</div>
+        <div class="value" id="risk-margin" style="font-size:18px;">–</div>
+        <div class="sub" id="risk-margin-avail">–</div>
+      </div>
+      <div class="card" style="padding:10px;">
+        <div class="label">Daily P&amp;L</div>
+        <div class="value" id="risk-pnl" style="font-size:18px;">–</div>
+        <div class="sub" id="risk-positions">– positions</div>
+      </div>
+    </div>
+  </div>
+
   <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:16px;">
     <span style="color:#8b949e; font-size:12px" id="pos-summary">Loading…</span>
     <button class="btn btn-secondary btn-sm" onclick="loadPositions()">↻ Refresh</button>
@@ -821,7 +853,7 @@
     <canvas id="chart-pnl" style="max-height:240px;"></canvas>
   </div>
 
-  <div class="table-wrap">
+  <div class="table-wrap" style="margin-bottom:28px;">
     <table>
       <thead><tr>
         <th>Date</th><th>Realised P&amp;L</th><th>Trades</th><th>Mode</th>
@@ -830,6 +862,28 @@
         <tr><td colspan="4" style="text-align:center; color:#484f58; padding:32px;">Loading…</td></tr>
       </tbody>
     </table>
+  </div>
+
+  <!-- ── Backtest Section ── -->
+  <div class="signal-box" style="margin-bottom:20px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px; margin-bottom:14px;">
+      <h2 style="margin:0;">BACKTEST — SIMULATED PERFORMANCE</h2>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <select id="bt-days" style="background:#21262d; border:1px solid #30363d; border-radius:6px; color:#c9d1d9; padding:5px 10px; font-size:12px;">
+          <option value="7">Last 7 days</option>
+          <option value="14">Last 14 days</option>
+          <option value="30" selected>Last 30 days</option>
+        </select>
+        <button class="btn btn-secondary btn-sm" onclick="loadBacktest()">Run Backtest</button>
+      </div>
+    </div>
+    <div id="bt-strategy-cards" style="display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin-bottom:16px;">
+      <div style="color:#484f58; text-align:center; padding:24px; grid-column:1/-1;">Click "Run Backtest" to simulate</div>
+    </div>
+    <div class="chart-box" id="bt-chart-box" style="display:none;">
+      <h3>Simulated Daily P&amp;L</h3>
+      <canvas id="chart-backtest" style="max-height:200px;"></canvas>
+    </div>
   </div>
 </div>
 
@@ -1126,9 +1180,39 @@ function preloadSignalToOrder() {
 }
 
 // ─────────────────────────────────────────────────────────
+//  RISK card (inside Positions tab)
+// ─────────────────────────────────────────────────────────
+async function loadRisk() {
+  try {
+    const r    = await fetch(`${API_BASE}/risk`);
+    const d    = await r.json();
+    const delta = parseFloat(d.per_lot_delta || 0);
+    const theta = parseFloat(d.total_theta_inr || 0);
+    const vega  = parseFloat(d.total_vega_inr || 0);
+    const mPct  = parseFloat(d.margin_used_pct || 0);
+    const pnl   = parseFloat(d.daily_pnl || 0);
+
+    const deltaEl = document.getElementById('risk-delta');
+    deltaEl.textContent = delta.toFixed(3);
+    deltaEl.className   = `value ${Math.abs(delta) > 0.3 ? 'down' : 'up'}`;
+
+    document.getElementById('risk-theta').textContent  = theta.toFixed(1);
+    document.getElementById('risk-vega').textContent   = vega.toFixed(1);
+    document.getElementById('risk-margin').textContent = mPct.toFixed(1) + '%';
+    document.getElementById('risk-margin-avail').textContent = `₹${(d.margin_available||0).toLocaleString('en-IN')} avail`;
+
+    const pnlEl = document.getElementById('risk-pnl');
+    pnlEl.textContent = (pnl >= 0 ? '+' : '') + '₹' + Math.abs(pnl).toLocaleString('en-IN');
+    pnlEl.className   = `value ${pnl >= 0 ? 'up' : 'down'}`;
+    document.getElementById('risk-positions').textContent = `${d.open_positions||0} open positions`;
+  } catch(e) { /* fail silently — non-critical */ }
+}
+
+// ─────────────────────────────────────────────────────────
 //  POSITIONS tab
 // ─────────────────────────────────────────────────────────
 async function loadPositions() {
+  loadRisk();
   try {
     const r    = await fetch(`${API_BASE}/positions`);
     const data = await r.json();
@@ -1566,6 +1650,82 @@ async function loadPnl() {
         '<tr><td colspan="4" style="text-align:center; color:#484f58; padding:32px;">No P&L history yet</td></tr>';
     }
   } catch(e) { console.error('P&L load error:', e); }
+}
+
+// ─────────────────────────────────────────────────────────
+//  BACKTEST
+// ─────────────────────────────────────────────────────────
+let btChart = null;
+
+async function loadBacktest() {
+  const days = parseInt(document.getElementById('bt-days').value || 30);
+  const cardsEl = document.getElementById('bt-strategy-cards');
+  cardsEl.innerHTML = '<div style="color:#8b949e; text-align:center; padding:24px; grid-column:1/-1;">Loading…</div>';
+  try {
+    const r = await fetch(`${API_BASE}/backtest?days=${days}`);
+    const d = await r.json();
+    if (d.error) {
+      cardsEl.innerHTML = `<div style="color:#f85149; padding:16px;">${d.error}</div>`;
+      return;
+    }
+
+    const strategies = d.strategies || {};
+    const keys = Object.keys(strategies);
+    if (!keys.length) {
+      cardsEl.innerHTML = '<div style="color:#484f58; text-align:center; padding:24px; grid-column:1/-1;">No signals in this period</div>';
+      return;
+    }
+
+    cardsEl.innerHTML = keys.map(s => {
+      const st = strategies[s];
+      const wr = st.win_rate_pct;
+      const wrCl = wr >= 60 ? 'up' : wr >= 40 ? 'warn' : 'down';
+      const pnlCl = st.total_pnl >= 0 ? 'up' : 'down';
+      return `<div class="card" style="padding:12px;">
+        <div class="label">${s.replace(/_/g,' ')}</div>
+        <div class="value ${pnlCl}" style="font-size:16px;">₹${(st.total_pnl||0).toLocaleString('en-IN',{maximumFractionDigits:0})}</div>
+        <div style="margin-top:6px; font-size:11px; color:#8b949e;">
+          Win rate: <span class="${wrCl}">${wr}%</span> &nbsp;|&nbsp;
+          Trades: ${st.trades}<br>
+          Avg/trade: ₹${(st.avg_pnl||0).toLocaleString('en-IN',{maximumFractionDigits:0})}<br>
+          Max drawdown: ₹${(st.max_drawdown||0).toLocaleString('en-IN',{maximumFractionDigits:0})}
+        </div>
+      </div>`;
+    }).join('');
+
+    // Chart of daily simulated P&L
+    const daily = d.daily_pnl || [];
+    if (daily.length) {
+      const btBox = document.getElementById('bt-chart-box');
+      btBox.style.display = 'block';
+      const labels = daily.map(x => x.date);
+      const vals   = daily.map(x => x.pnl);
+      if (btChart) { btChart.destroy(); }
+      btChart = new Chart(document.getElementById('chart-backtest'), {
+        type: 'bar',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Simulated P&L',
+            data: vals,
+            backgroundColor: vals.map(v => v >= 0 ? '#2ea04340' : '#da363640'),
+            borderColor:     vals.map(v => v >= 0 ? '#3fb950'   : '#f85149'),
+            borderWidth: 1,
+          }]
+        },
+        options: {
+          responsive: true,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#21262d' } },
+            y: { ticks: { color: '#8b949e', font: { size: 10 } }, grid: { color: '#21262d' } },
+          }
+        }
+      });
+    }
+  } catch(e) {
+    cardsEl.innerHTML = '<div style="color:#f85149; padding:16px;">Backtest failed: ' + e.message + '</div>';
+  }
 }
 
 // ─────────────────────────────────────────────────────────

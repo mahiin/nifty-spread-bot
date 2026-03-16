@@ -75,11 +75,16 @@ def check_oi_divergence(quote_data: dict, near_sym: str, next_sym: str) -> dict:
     next_oi = float(quote_data.get(f"NFO:{next_sym}", {}).get("opnInterest", 0) or 0)
     oi_diff = next_oi - near_oi
     rollover_signal = oi_diff > 50_000
+    total_oi = near_oi + next_oi
+    rollover_pct = round((next_oi / total_oi * 100), 1) if total_oi > 0 else 0.0
+    rollover_strong = rollover_pct > 70   # near-month compression begins
     return {
         "near_oi":         near_oi,
         "next_oi":         next_oi,
         "oi_diff":         oi_diff,
         "rollover_signal": rollover_signal,
+        "rollover_pct":    rollover_pct,
+        "rollover_strong": rollover_strong,
     }
 
 
