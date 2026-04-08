@@ -101,8 +101,12 @@ def build_intraday_plan(
     put_price:     float,   # ATM put premium (per unit)
     call_symbol:   str,
     put_symbol:    str,
-    lot_size:      int  = 75,
-    safety_regime: str  = "SAFE",   # SAFE | CAUTION | HALT
+    lot_size:      int   = 75,
+    safety_regime: str   = "SAFE",   # SAFE | CAUTION | HALT
+    # ── Momentum confirmation (from momentum_engine) ──────────────────
+    rsi:           float = 50.0,
+    vwap:          float = 0.0,
+    ema20:         float = 0.0,
 ) -> dict:
     """
     Build intraday trading plan from market-open data.
@@ -220,12 +224,23 @@ def build_intraday_plan(
     elif gap_pct > 0.5 and vix_rising is not True and vix < 22:
         strategy   = IntradayStrategy.BUY_CE
         emoji      = "📈"
-        confidence = "HIGH" if gap_pct > 1.0 else "MEDIUM"
         vix_dir    = "falling" if vix_rising is False else "stable"
+        # Upgrade confidence when VWAP+RSI momentum confirms direction
+        _mom_confirms = vwap > 0 and spot_price > vwap and rsi > 55
+        if gap_pct > 1.0 and _mom_confirms:
+            confidence = "HIGH"
+        elif gap_pct > 1.0 or _mom_confirms:
+            confidence = "HIGH" if gap_pct > 1.0 else "MEDIUM"
+        else:
+            confidence = "MEDIUM"
+        _mom_note = (
+            f" VWAP confirmation: price > VWAP ({vwap:.0f}), RSI={rsi:.0f}."
+            if _mom_confirms else ""
+        )
         reason     = (
             f"Gap UP {gap_pct:+.2f}% from prev close. VIX = {vix:.1f} ({vix_dir}). "
             f"Classic trend-day setup: bullish momentum + calm VIX. "
-            f"Buy ATM call to ride the move."
+            f"Buy ATM call to ride the move.{_mom_note}"
         )
         target_level = round(spot_price + 150)
         sl_level     = round(spot_price - 80)
@@ -243,12 +258,23 @@ def build_intraday_plan(
     elif gap_pct < -0.5 and vix_rising is not True and vix < 22:
         strategy   = IntradayStrategy.BUY_PE
         emoji      = "📉"
-        confidence = "HIGH" if gap_pct < -1.0 else "MEDIUM"
         vix_dir    = "falling" if vix_rising is False else "stable"
+        # Upgrade confidence when VWAP+RSI momentum confirms direction
+        _mom_confirms = vwap > 0 and spot_price < vwap and rsi < 45
+        if gap_pct < -1.0 and _mom_confirms:
+            confidence = "HIGH"
+        elif gap_pct < -1.0 or _mom_confirms:
+            confidence = "HIGH" if gap_pct < -1.0 else "MEDIUM"
+        else:
+            confidence = "MEDIUM"
+        _mom_note = (
+            f" VWAP confirmation: price < VWAP ({vwap:.0f}), RSI={rsi:.0f}."
+            if _mom_confirms else ""
+        )
         reason     = (
             f"Gap DOWN {gap_pct:+.2f}% from prev close. VIX = {vix:.1f} ({vix_dir}). "
             f"Classic trend-day setup: bearish momentum + calm VIX. "
-            f"Buy ATM put to ride the downside."
+            f"Buy ATM put to ride the downside.{_mom_note}"
         )
         target_level = round(spot_price - 150)
         sl_level     = round(spot_price + 80)

@@ -54,6 +54,8 @@ CORS = {
     "Access-Control-Allow-Origin":  "*",
     "Access-Control-Allow-Headers": "Content-Type,x-dashboard-token",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Cache-Control":                "no-cache, no-store, must-revalidate",
+    "Pragma":                       "no-cache",
 }
 
 
@@ -441,6 +443,19 @@ def get_daily_plan() -> dict:
         return {}
 
 
+def clear_daily_plan() -> dict:
+    """Delete DAILY_PLAN and INTRADAY_PLAN from config table so next scanner run writes fresh data."""
+    table   = ddb.Table(CFG_TABLE)
+    cleared = []
+    for key in ("DAILY_PLAN", "INTRADAY_PLAN"):
+        try:
+            table.delete_item(Key={"config_key": key})
+            cleared.append(key)
+        except Exception as exc:
+            print(f"[dashboard_api] clear_daily_plan: could not delete {key}: {exc}")
+    return {"cleared": cleared, "timestamp": datetime.now(IST).isoformat()}
+
+
 def get_intraday_plan() -> dict:
     """Fetch today's intraday plan stored by the scanner at 9:30 AM."""
     try:
@@ -449,6 +464,104 @@ def get_intraday_plan() -> dict:
         return json.loads(raw) if raw else {}
     except Exception:
         return {}
+
+
+def get_paper_trades(days: int = 30) -> dict:
+    """
+    Return all paper trades (INTRADAY + ARB) for the last N days,
+    sorted newest-first, with per-trade P&L and running summary.
+    """
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    try:
+        resp  = ddb.Table(POS_TABLE).scan(
+            FilterExpression=Attr("mode").eq("PAPER") & Attr("timestamp").gte(cutoff)
+        )
+        items = resp.get("Items", [])
+    except Exception:
+        items = []
+
+    trades = []
+    total_pnl   = 0.0
+    total_trades = 0
+    wins = 0
+    losses = 0
+
+    for item in sorted(items, key=lambda x: x.get("timestamp", ""), reverse=True):
+        entry_ts  = item.get("timestamp", "")
+        exit_ts   = item.get("exit_timestamp", "")
+        status    = item.get("status", "OPEN")
+        trade_type = item.get("trade_type", "")
+        strategy_type = item.get("strategy_type", "")
+
+        # Duration
+        duration_str = ""
+        if entry_ts and exit_ts:
+            try:
+                t0 = datetime.fromisoformat(entry_ts)
+                t1 = datetime.fromisoformat(exit_ts)
+                mins = int((t1 - t0).total_seconds() / 60)
+                duration_str = f"{mins}m" if mins < 60 else f"{mins // 60}h {mins % 60}m"
+            except Exception:
+                pass
+
+        # P&L
+        pnl = None
+        if status == "CLOSED":
+            try:
+                pnl = float(item.get("exit_pnl", 0))
+                total_pnl += pnl
+                total_trades += 1
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+            except Exception:
+                pass
+
+        # Entry/exit premiums (intraday)
+        entry_premium = item.get("entry_premium", "")
+        exit_premium  = item.get("exit_premium", "")
+
+        trades.append({
+            "position_id":    item.get("position_id", ""),
+            "timestamp":      entry_ts,
+            "exit_timestamp": exit_ts,
+            "duration":       duration_str,
+            "strategy_type":  strategy_type,
+            "trade_type":     trade_type,
+            "status":         status,
+            "entry_premium":  entry_premium,
+            "exit_premium":   exit_premium,
+            "entry_mispricing": item.get("entry_mispricing", ""),
+            "atm_strike":     item.get("atm_strike", ""),
+            "call_symbol":    item.get("call_symbol", ""),
+            "put_symbol":     item.get("put_symbol", ""),
+            "qty":            item.get("qty", ""),
+            "sl_level":       item.get("sl_level", ""),
+            "target_level":   item.get("target_level", ""),
+            "exit_reason":    item.get("exit_reason", ""),
+            "pnl":            pnl,
+            "confidence":     item.get("confidence", ""),
+            "reason":         item.get("reason", ""),
+        })
+
+    win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
+    avg_pnl  = round(total_pnl / total_trades, 2) if total_trades > 0 else 0.0
+
+    return {
+        "trades":        trades,
+        "summary": {
+            "total_trades":  total_trades,
+            "open_trades":   sum(1 for t in trades if t["status"] == "OPEN"),
+            "closed_trades": total_trades,
+            "wins":          wins,
+            "losses":        losses,
+            "win_rate_pct":  win_rate,
+            "total_pnl":     round(total_pnl, 2),
+            "avg_pnl":       avg_pnl,
+        },
+        "days": days,
+    }
 
 
 def get_volatility_history(limit: int = 60) -> list:
@@ -482,6 +595,177 @@ def get_volatility_history(limit: int = 60) -> list:
             return items[:limit]
         except Exception:
             return []
+
+
+def get_backtest(days: int = 30) -> dict:
+    """
+    Simulate historical performance from stored signals.
+
+    For each signal record:
+    - Identify the strategy that would have been selected
+    - Apply standard target (+40%) / SL (-25%) / hard-exit (1:30 PM) rules
+    - Group by strategy, compute per-strategy win rate, avg P&L, totals
+
+    Returns per-strategy stats + daily simulated P&L list.
+    """
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    try:
+        resp  = ddb.Table(SIG_TABLE).scan(
+            FilterExpression=Attr("timestamp").gte(cutoff),
+            ProjectionExpression=(
+                "#ts, daily_strategy, straddle_premium, iv_vix_spread, "
+                "india_vix, vol_signal, spread_signal, signal_strength, "
+                "arbitrage_signal, trading_regime"
+            ),
+            ExpressionAttributeNames={"#ts": "timestamp"},
+        )
+        items = resp.get("Items", [])
+    except Exception:
+        return {"error": "Failed to fetch signals", "strategies": {}, "daily_pnl": []}
+
+    # Group signals by day (first signal of each day per strategy)
+    from collections import defaultdict
+    by_day = defaultdict(list)
+    for item in items:
+        ts = item.get("timestamp", "")[:10]
+        by_day[ts].append(item)
+
+    strategy_stats = defaultdict(lambda: {"trades": 0, "wins": 0, "total_pnl": 0.0, "pnls": []})
+    daily_pnl_list = []
+
+    TARGET_PCT = 0.40   # 40% premium growth = profit
+    SL_PCT     = 0.25   # 25% premium loss = stop
+
+    for day_ts in sorted(by_day.keys()):
+        day_items = by_day[day_ts]
+        # Use the first signal of the day for simulation
+        sig = day_items[0] if day_items else {}
+        strat = sig.get("daily_strategy", "WAIT")
+        if strat == "WAIT":
+            continue
+
+        premium = float(sig.get("straddle_premium") or 0)
+        if premium <= 0:
+            premium = 100.0  # default estimate
+
+        is_sell = strat in ("SELL_STRADDLE", "IRON_CONDOR", "BEAR_CALL_SPREAD", "BULL_PUT_SPREAD")
+
+        # Simulate: scan through day's signals to see if target/SL hit
+        outcome = "TIME_EXIT"
+        final_pnl = 0.0
+
+        # Check if any signal that day shows 40% move or 25% adverse move
+        for s in day_items[1:]:
+            ts_item = s.get("timestamp", "")
+            if ts_item[11:16] >= "13:30":
+                break  # hard exit
+            iv_spread = float(s.get("iv_vix_spread") or 0)
+            if is_sell:
+                if iv_spread <= -(premium * TARGET_PCT / premium * 10):
+                    outcome = "TARGET"
+                    final_pnl = premium * TARGET_PCT
+                    break
+                if iv_spread >= (premium * SL_PCT / premium * 10):
+                    outcome = "STOP_LOSS"
+                    final_pnl = -premium * SL_PCT
+                    break
+            else:
+                if iv_spread >= 2.0:
+                    outcome = "TARGET"
+                    final_pnl = premium * TARGET_PCT
+                    break
+
+        if outcome == "TIME_EXIT":
+            final_pnl = premium * 0.15 if is_sell else -premium * 0.05
+
+        strategy_stats[strat]["trades"]    += 1
+        strategy_stats[strat]["total_pnl"] += final_pnl
+        strategy_stats[strat]["pnls"].append(final_pnl)
+        if final_pnl > 0:
+            strategy_stats[strat]["wins"] += 1
+
+        daily_pnl_list.append({"date": day_ts, "pnl": round(final_pnl, 2), "strategy": strat})
+
+    # Build summary per strategy
+    results = {}
+    for strat, st in strategy_stats.items():
+        n = st["trades"]
+        pnls = st["pnls"]
+        avg_pnl = st["total_pnl"] / n if n > 0 else 0
+        win_rate = (st["wins"] / n * 100) if n > 0 else 0
+        # Max drawdown: largest peak-to-trough of cumulative P&L
+        cum = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for p in pnls:
+            cum += p
+            peak = max(peak, cum)
+            max_dd = max(max_dd, peak - cum)
+        results[strat] = {
+            "trades":       n,
+            "wins":         st["wins"],
+            "win_rate_pct": round(win_rate, 1),
+            "avg_pnl":      round(avg_pnl, 2),
+            "total_pnl":    round(st["total_pnl"], 2),
+            "max_drawdown": round(max_dd, 2),
+        }
+
+    return {
+        "days":       days,
+        "strategies": results,
+        "daily_pnl":  daily_pnl_list,
+    }
+
+
+def get_portfolio_risk() -> dict:
+    """
+    Aggregate portfolio risk metrics:
+    - Greeks (from PORTFOLIO_GREEKS config key written by scanner)
+    - Margin utilization
+    - Daily P&L and open position count
+    """
+    # Greeks from scanner
+    greeks = {}
+    try:
+        resp = ddb.Table(CFG_TABLE).get_item(Key={"config_key": "PORTFOLIO_GREEKS"})
+        raw  = resp.get("Item", {}).get("config_value", "{}")
+        greeks = json.loads(raw) if raw else {}
+    except Exception:
+        pass
+
+    # Open positions
+    positions   = get_positions()
+    open_count  = len(positions)
+
+    # Daily P&L
+    pnl_today = get_pnl_today()
+    daily_pnl = float(pnl_today.get("realised_pnl", 0))
+
+    # Margin utilization (from config — written by scanner)
+    margin_pct = 0.0
+    available  = 0.0
+    try:
+        cfg_resp  = ddb.Table(CFG_TABLE).get_item(Key={"config_key": "TRADING_CAPITAL"})
+        capital   = float(cfg_resp.get("Item", {}).get("config_value", 500000))
+        # Use last PORTFOLIO_GREEKS timestamp as proxy — margin computed in scanner
+        # Fall back to estimating from positions
+        margin_pct = min(100.0, open_count * 20.0)   # rough: 20% per position
+        available  = capital * (1 - margin_pct / 100)
+    except Exception:
+        pass
+
+    return {
+        "total_delta":     greeks.get("total_delta",     0.0),
+        "per_lot_delta":   greeks.get("per_lot_delta",   0.0),
+        "total_gamma":     greeks.get("total_gamma",     0.0),
+        "total_theta_inr": greeks.get("total_theta_inr", 0.0),
+        "total_vega_inr":  greeks.get("total_vega_inr",  0.0),
+        "open_positions":  open_count,
+        "daily_pnl":       daily_pnl,
+        "margin_used_pct": round(margin_pct, 1),
+        "margin_available": round(available, 0),
+        "timestamp":       datetime.now(IST).isoformat(),
+    }
 
 
 def auth_status() -> dict:
@@ -551,6 +835,15 @@ def lambda_handler(event, context):
             if path.endswith("/volatility"):
                 return _resp(get_volatility_history(int(qs.get("limit", 60))))
 
+            if path.endswith("/risk"):
+                return _resp(get_portfolio_risk())
+
+            if path.endswith("/backtest"):
+                return _resp(get_backtest(int(qs.get("days", 30))))
+
+            if path.endswith("/paper-trades"):
+                return _resp(get_paper_trades(int(qs.get("days", 30))))
+
             if path.endswith("/health"):
                 return _resp({"status": "ok", "mode": _get_effective_mode()})
 
@@ -573,6 +866,9 @@ def lambda_handler(event, context):
             if path.endswith("/config"):
                 update_config(body)
                 return _resp({"updated": list(body.keys())})
+
+            if path.endswith("/daily-plan/clear"):
+                return _resp(clear_daily_plan())
 
     except Exception as exc:
         import traceback

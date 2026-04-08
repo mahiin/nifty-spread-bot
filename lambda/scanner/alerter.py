@@ -418,7 +418,7 @@ def send_premarket_report(report: dict):
         + (f"<i>{strat_note}</i>\n" if strat_note else "")
         + event_line
         + f"\n"
-        f"\n<b>Entry window: 9:30–10:00 AM only</b>\n"
+        f"\n<b>Entry window: 9:45–11:00 AM only</b>\n"
         f"Hard exit: 1:30 PM (no exceptions)\n"
         f"\n📋 <i>Open dashboard for live signals</i>"
     )
@@ -450,7 +450,7 @@ def send_intraday_alert(plan: dict):
     risk_note  = plan.get("risk_note", "")
     sl_note    = plan.get("sl_note", "")
     tgt_note   = plan.get("target_note", "")
-    entry_win  = plan.get("entry_window", "9:30–10:00 AM")
+    entry_win  = plan.get("entry_window", "9:45–11:00 AM")
     hard_exit  = plan.get("hard_exit", "1:30 PM")
     legs_text  = plan.get("legs_text", "No action.")
 

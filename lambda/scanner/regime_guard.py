@@ -236,7 +236,9 @@ def get_india_vix(broker) -> Optional[float]:
         elif broker_type == "AngelOneBroker":
             # India VIX token on NSE = 99926017
             data = broker.get_ltp(["NSE:99926017"])
-            return float(data.get("NSE:India VIX", {}).get("ltp") or 0) or None
+            # Use first result to avoid hardcoded tradingSymbol mismatch
+            item = next(iter(data.values()), {}) if data else {}
+            return float(item.get("ltp") or 0) or None
     except Exception:
         pass
     return None

@@ -453,3 +453,354 @@ def _empty_futures() -> dict:
         "fetched_at":      datetime.now(IST).isoformat(),
         "source":          "FALLBACK",
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FII Daily History & 3-Day Trend Analysis
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Strategy:
+#   • store_daily_fii_snapshot() — saves today's FII data to nifty_fii_history
+#     (keyed by date; idempotent). Call once per Lambda invocation (non-fatal).
+#   • get_fii_trend()            — reads 5 trading days of history, computes:
+#       - trend_direction: BULLISH / BEARISH / NEUTRAL
+#       - ls_ratio_trend : RISING / FALLING / FLAT
+#       - consecutive_days: how many days FII has been consistently one-directional
+#   • get_cash_futures_divergence() — TRUE_EXIT vs HEDGING detection
+#   • get_fii_composite_signal()    — single combined direction + confidence
+#
+# Table: nifty_fii_history (primary key: date YYYY-MM-DD)
+# ══════════════════════════════════════════════════════════════════════════════
+
+FII_HISTORY_TABLE = os.environ.get("FII_HISTORY_TABLE", "nifty_fii_history")
+_TREND_DAYS       = 5
+
+
+def store_daily_fii_snapshot(cash_data: dict, futures_data: dict) -> None:
+    """
+    Save today's FII data point to nifty_fii_history for trend tracking.
+    Idempotent — same date key overwrites on repeated calls.
+    Call this once per Lambda run; errors are non-fatal.
+    """
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    try:
+        # Compute L/S ratio — stored as string (DynamoDB Decimal-safe)
+        fut_long  = int(futures_data.get("fii_fut_long",  0))
+        fut_short = int(futures_data.get("fii_fut_short", 0))
+        ls_ratio  = round(fut_long / fut_short, 3) if fut_short > 0 else 0.0
+        _ddb.Table(FII_HISTORY_TABLE).put_item(Item={
+            "date":          today,
+            "fii_fut_long":  str(fut_long),
+            "fii_fut_short": str(fut_short),
+            "fii_fut_net":   str(int(futures_data.get("fii_fut_net", 0))),
+            "fii_ls_ratio":  str(ls_ratio),
+            "fii_opt_pcr":   str(round(float(futures_data.get("fii_opt_pcr", 1.0)), 3)),
+            "fii_net_cr":    str(round(float(cash_data.get("fii_net_cr",  0.0)), 2)),
+            "fii_signal":    cash_data.get("signal",     "FII_NEUTRAL"),
+            "fut_signal":    futures_data.get("fut_signal", "FII_FUT_NEUTRAL"),
+            "timestamp":     datetime.now(IST).isoformat(),
+        })
+        print(f"[fii_history] Snapshot saved for {today}: fut_net={futures_data.get('fii_fut_net',0):+,d} ls_ratio={ls_ratio:.3f}")
+    except Exception as exc:
+        print(f"[fii_history] Snapshot write failed (non-fatal): {exc}")
+
+
+def get_fii_trend(days: int = _TREND_DAYS) -> dict:
+    """
+    Read the last `days` records from nifty_fii_history and compute:
+
+    Returns:
+      trend_direction  – BULLISH / BEARISH / NEUTRAL  (net futures direction)
+      ls_ratio_trend   – RISING / FALLING / FLAT       (L/S ratio momentum)
+      net_change_5d    – total futures contracts added (positive = net buying)
+      consecutive_days – how many days in a row same direction
+      score            – raw directional score (-5 … +5)
+      history          – list of daily snapshot dicts (newest first)
+      confidence       – HIGH (3+ consecutive) / MEDIUM (trend visible) / LOW
+    """
+    history = _load_fii_history(days)
+
+    empty = {
+        "trend_direction":  "NEUTRAL",
+        "ls_ratio_trend":   "FLAT",
+        "net_change_5d":    0,
+        "consecutive_days": 0,
+        "score":            0,
+        "confidence":       "LOW",
+        "history":          history,
+    }
+
+    if len(history) < 2:
+        return empty
+
+    # Newest record first; sort descending by date
+    history_sorted = sorted(history, key=lambda x: x.get("date", ""), reverse=True)
+
+    # ── Net futures direction each day ────────────────────────────────────────
+    direction_days = []   # +1 = bullish, -1 = bearish, 0 = neutral
+    ls_ratios      = []
+
+    for rec in history_sorted:
+        fut_net  = int(rec.get("fii_fut_net", 0))
+        ls_ratio = float(rec.get("fii_ls_ratio", 1.0))
+        ls_ratios.append(ls_ratio)
+        if fut_net >= FII_FUT_LONG_THR:
+            direction_days.append(1)
+        elif fut_net <= FII_FUT_SHORT_THR:
+            direction_days.append(-1)
+        else:
+            direction_days.append(0)
+
+    # ── Consecutive streak (from most recent backwards) ─────────────────────
+    streak_dir  = direction_days[0]   # today's direction
+    consecutive = 1
+    if streak_dir != 0:
+        for d in direction_days[1:]:
+            if d == streak_dir:
+                consecutive += 1
+            else:
+                break
+
+    # ── 5-day cumulative net change ──────────────────────────────────────────
+    net_change_5d = sum(int(r.get("fii_fut_net", 0)) for r in history_sorted)
+
+    # ── L/S ratio trend: is ratio rising or falling? ─────────────────────────
+    if len(ls_ratios) >= 3:
+        recent_avg = sum(ls_ratios[:2]) / 2          # avg of last 2 days
+        older_avg  = sum(ls_ratios[2:]) / len(ls_ratios[2:])  # avg of earlier
+        if recent_avg > older_avg + 0.05:
+            ls_ratio_trend = "RISING"
+        elif recent_avg < older_avg - 0.05:
+            ls_ratio_trend = "FALLING"
+        else:
+            ls_ratio_trend = "FLAT"
+    else:
+        ls_ratio_trend = "FLAT"
+
+    # ── Overall directional score ────────────────────────────────────────────
+    score = sum(direction_days)   # range: -5 to +5
+
+    # ── Trend direction ──────────────────────────────────────────────────────
+    if score >= 2:
+        trend_direction = "BULLISH"
+    elif score <= -2:
+        trend_direction = "BEARISH"
+    else:
+        trend_direction = "NEUTRAL"
+
+    # ── Confidence ───────────────────────────────────────────────────────────
+    if consecutive >= 3:
+        confidence = "HIGH"
+    elif consecutive >= 2 or abs(score) >= 3:
+        confidence = "MEDIUM"
+    else:
+        confidence = "LOW"
+
+    return {
+        "trend_direction":  trend_direction,
+        "ls_ratio_trend":   ls_ratio_trend,
+        "net_change_5d":    net_change_5d,
+        "consecutive_days": consecutive,
+        "score":            score,
+        "confidence":       confidence,
+        "history":          history_sorted,
+    }
+
+
+def get_cash_futures_divergence(cash_data: dict, futures_data: dict) -> dict:
+    """
+    Detect whether FII is HEDGING (short futures / neutral cash) vs
+    TRUE EXIT (short futures + cash selling simultaneously).
+
+    This is critical: FII routinely short index futures to hedge their large
+    equity portfolio. That is NOT a bearish signal. Only when BOTH cash and
+    futures move together does it become a true directional signal.
+
+    Returns:
+      divergence – TRUE_EXIT | TRUE_ACCUMULATION | HEDGING | NONE
+      signal     – STRONG_BEARISH | STRONG_BULLISH | NEUTRAL_OR_MILD_BEARISH | NEUTRAL
+      explanation – human-readable string
+    """
+    cash_sig   = cash_data.get("signal",     "FII_NEUTRAL")
+    fut_sig    = futures_data.get("fut_signal", "FII_FUT_NEUTRAL")
+    fii_net_cr = float(cash_data.get("fii_net_cr", 0))
+    fut_net    = int(futures_data.get("fii_fut_net", 0))
+
+    # TRUE EXIT: cash selling AND futures short
+    if cash_sig == "FII_BEARISH" and fut_sig == "FII_FUT_SHORT":
+        return {
+            "divergence":  "TRUE_EXIT",
+            "signal":      "STRONG_BEARISH",
+            "explanation": (
+                f"FII selling both cash (₹{fii_net_cr:+,.0f}Cr) AND "
+                f"index futures (net {fut_net:+,d} contracts). "
+                "True institutional exit — strong bearish signal."
+            ),
+        }
+
+    # TRUE ACCUMULATION: cash buying AND futures long
+    if cash_sig == "FII_BULLISH" and fut_sig == "FII_FUT_LONG":
+        return {
+            "divergence":  "TRUE_ACCUMULATION",
+            "signal":      "STRONG_BULLISH",
+            "explanation": (
+                f"FII buying both cash (₹{fii_net_cr:+,.0f}Cr) AND "
+                f"holding index futures long (net {fut_net:+,d} contracts). "
+                "True accumulation — strong bullish signal."
+            ),
+        }
+
+    # HEDGING: cash selling but futures neutral/long → just protecting equity book
+    if cash_sig == "FII_BEARISH" and fut_sig in ("FII_FUT_NEUTRAL", "FII_FUT_LONG"):
+        return {
+            "divergence":  "HEDGING",
+            "signal":      "NEUTRAL_OR_MILD_BEARISH",
+            "explanation": (
+                f"FII selling cash (₹{fii_net_cr:+,.0f}Cr) but "
+                f"futures net {fut_net:+,d} contracts (not short). "
+                "Likely hedging equity portfolio — NOT a true bearish bet."
+            ),
+        }
+
+    # PARTIAL BULLISH: cash neutral but futures long
+    if cash_sig != "FII_BEARISH" and fut_sig == "FII_FUT_LONG":
+        return {
+            "divergence":  "NONE",
+            "signal":      "MILD_BULLISH",
+            "explanation": (
+                f"FII net long index futures ({fut_net:+,d} contracts) "
+                f"with neutral cash flow (₹{fii_net_cr:+,.0f}Cr). "
+                "Mild bullish bias via futures positioning."
+            ),
+        }
+
+    return {
+        "divergence":  "NONE",
+        "signal":      "NEUTRAL",
+        "explanation": (
+            f"Cash: {cash_sig} (₹{fii_net_cr:+,.0f}Cr)  "
+            f"Futures: {fut_sig} ({fut_net:+,d} contracts). "
+            "No clear institutional directional conviction."
+        ),
+    }
+
+
+def get_fii_composite_signal(
+    cash_data:    dict,
+    futures_data: dict,
+    trend:        dict,
+) -> dict:
+    """
+    Single composite FII signal combining:
+      1. Single-day futures positioning (gold standard)
+      2. 3–5 day rolling trend direction + consecutive streak
+      3. Cash vs futures divergence (TRUE_EXIT vs HEDGING)
+      4. FII options PCR
+
+    Returns:
+      direction   – BULLISH | BEARISH | NEUTRAL
+      confidence  – HIGH | MEDIUM | LOW
+      score       – int (-10 … +10): positive = bullish
+      action      – what strategy bias to apply
+      explanation – human-readable
+    """
+    score = 0
+
+    # ── 1. Single-day futures signal ──────────────────────────────────────────
+    fut_sig = futures_data.get("fut_signal", "FII_FUT_NEUTRAL")
+    if fut_sig == "FII_FUT_LONG":
+        score += 3
+    elif fut_sig == "FII_FUT_SHORT":
+        score -= 3
+
+    # ── 2. 3-5 day trend ──────────────────────────────────────────────────────
+    trend_dir  = trend.get("trend_direction", "NEUTRAL")
+    consec     = int(trend.get("consecutive_days", 0))
+    ls_trend   = trend.get("ls_ratio_trend", "FLAT")
+
+    if trend_dir == "BULLISH":
+        score += min(consec, 3)          # up to +3 for streak
+    elif trend_dir == "BEARISH":
+        score -= min(consec, 3)          # up to -3 for streak
+
+    if ls_trend == "RISING":
+        score += 1
+    elif ls_trend == "FALLING":
+        score -= 1
+
+    # ── 3. Cash vs futures divergence ────────────────────────────────────────
+    div   = get_cash_futures_divergence(cash_data, futures_data)
+    dsig  = div.get("signal", "NEUTRAL")
+    if dsig == "STRONG_BULLISH":
+        score += 2
+    elif dsig == "STRONG_BEARISH":
+        score -= 2
+    elif dsig == "MILD_BULLISH":
+        score += 1
+    elif dsig == "NEUTRAL_OR_MILD_BEARISH":
+        score -= 1
+
+    # ── 4. FII options PCR (put/call ratio) ──────────────────────────────────
+    opt_pcr = float(futures_data.get("fii_opt_pcr", 1.0))
+    if opt_pcr > 1.3:
+        score -= 1   # FII buying more puts = hedging/bearish
+    elif opt_pcr < 0.7:
+        score += 1   # FII buying more calls = bullish
+
+    # ── Decision ──────────────────────────────────────────────────────────────
+    if score >= 5:
+        direction  = "BULLISH"
+        confidence = "HIGH"
+        action     = "BULL_PUT_SPREAD or BULL_CALL_SPREAD"
+    elif score >= 2:
+        direction  = "BULLISH"
+        confidence = "MEDIUM"
+        action     = "BULL_PUT_SPREAD (reduce size 50% if MEDIUM)"
+    elif score <= -5:
+        direction  = "BEARISH"
+        confidence = "HIGH"
+        action     = "BEAR_CALL_SPREAD or BUY_STRANGLE if VIX rising"
+    elif score <= -2:
+        direction  = "BEARISH"
+        confidence = "MEDIUM"
+        action     = "BEAR_CALL_SPREAD (reduce size 50%)"
+    else:
+        direction  = "NEUTRAL"
+        confidence = "LOW"
+        action     = "IRON_CONDOR or WAIT — no clear FII directional conviction"
+
+    return {
+        "direction":     direction,
+        "confidence":    confidence,
+        "score":         score,
+        "action":        action,
+        "divergence":    div.get("divergence", "NONE"),
+        "divergence_explanation": div.get("explanation", ""),
+        "fut_signal":    fut_sig,
+        "trend_direction": trend_dir,
+        "consecutive_days": consec,
+        "ls_ratio_trend": ls_trend,
+        "opt_pcr":       opt_pcr,
+    }
+
+
+# ── History DynamoDB helpers ──────────────────────────────────────────────────
+
+def _load_fii_history(days: int) -> list:
+    """Fetch last `days` records from nifty_fii_history table."""
+    try:
+        # Scan with date filter: last N calendar days (covers weekends too)
+        from datetime import timedelta
+        cutoff = (datetime.now(IST) - timedelta(days=days + 3)).strftime("%Y-%m-%d")
+        resp = _ddb.Table(FII_HISTORY_TABLE).scan(
+            FilterExpression="#d >= :c",
+            ExpressionAttributeNames={"#d": "date"},
+            ExpressionAttributeValues={":c": cutoff},
+        )
+        items = resp.get("Items", [])
+        # Sort descending by date, return latest `days` entries
+        items.sort(key=lambda x: x.get("date", ""), reverse=True)
+        return items[:days]
+    except Exception as exc:
+        print(f"[fii_history] Load failed (non-fatal): {exc}")
+        return []

@@ -418,7 +418,7 @@ def send_premarket_report(report: dict):
         + (f"<i>{strat_note}</i>\n" if strat_note else "")
         + event_line
         + f"\n"
-        f"\n<b>Entry window: 9:30–10:00 AM only</b>\n"
+        f"\n<b>Entry window: 9:45–11:00 AM only</b>\n"
         f"Hard exit: 1:30 PM (no exceptions)\n"
         f"\n📋 <i>Open dashboard for live signals</i>"
     )
@@ -450,7 +450,7 @@ def send_intraday_alert(plan: dict):
     risk_note  = plan.get("risk_note", "")
     sl_note    = plan.get("sl_note", "")
     tgt_note   = plan.get("target_note", "")
-    entry_win  = plan.get("entry_window", "9:30–10:00 AM")
+    entry_win  = plan.get("entry_window", "9:45–11:00 AM")
     hard_exit  = plan.get("hard_exit", "1:30 PM")
     legs_text  = plan.get("legs_text", "No action.")
 
@@ -488,6 +488,84 @@ def send_intraday_alert(plan: dict):
         + (f"\n⚠️ <i>{risk_note}</i>" if risk_note else "")
     )
 
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def send_margin_alert(margin_pct: float, available: float, capital: float):
+    """
+    Alert when margin utilization exceeds 60%.
+    Cooldown: once per hour via MARGIN_ALERT_TS in DynamoDB config.
+    """
+    import boto3
+    from datetime import datetime
+    import pytz
+    IST = pytz.timezone("Asia/Kolkata")
+
+    # Hourly cooldown check
+    try:
+        region  = os.environ.get("AWS_REGION_NAME", "ap-south-1")
+        cfg_tbl = boto3.resource("dynamodb", region_name=region).Table(
+            os.environ.get("CONFIG_TABLE", "nifty_config")
+        )
+        last_ts_item = cfg_tbl.get_item(Key={"config_key": "MARGIN_ALERT_TS"}).get("Item", {})
+        last_ts = last_ts_item.get("config_value", "")
+        if last_ts:
+            last_dt = datetime.fromisoformat(last_ts)
+            if last_dt.tzinfo is None:
+                last_dt = IST.localize(last_dt)
+            if (datetime.now(IST) - last_dt).total_seconds() < 3600:
+                return  # cooldown not expired
+        cfg_tbl.put_item(Item={"config_key": "MARGIN_ALERT_TS", "config_value": datetime.now(IST).isoformat()})
+    except Exception:
+        pass
+
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID",   "")
+    if not token or not chat_id:
+        return
+
+    msg = (
+        f"⚠️ <b>MARGIN ALERT</b>\n"
+        f"Margin used: <b>{margin_pct:.1f}%</b>\n"
+        f"Available  : ₹{available:,.0f}\n"
+        f"Capital    : ₹{capital:,.0f}\n"
+        f"\n<i>Consider reducing positions to free up margin.</i>"
+    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def send_delta_alert(delta: float, positions: list):
+    """Alert when portfolio net delta is too high (directional risk)."""
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID",   "")
+    if not token or not chat_id:
+        return
+
+    pos_lines = ""
+    for p in positions[:5]:   # show up to 5 positions
+        pos_lines += f"  • {p.get('trade_type','')} | Δ={p.get('delta', '–')}\n"
+
+    msg = (
+        f"⚠️ <b>PORTFOLIO DELTA ALERT</b>\n"
+        f"Net delta: <b>{delta:+.3f} per lot</b>\n"
+        f"Threshold: ±0.30 per lot\n"
+        f"\n<b>Open positions:</b>\n{pos_lines}"
+        f"\n<i>Hedge required — consider buying/selling a futures leg.</i>"
+    )
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",

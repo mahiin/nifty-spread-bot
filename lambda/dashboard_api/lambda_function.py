@@ -54,6 +54,8 @@ CORS = {
     "Access-Control-Allow-Origin":  "*",
     "Access-Control-Allow-Headers": "Content-Type,x-dashboard-token",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Cache-Control":                "no-cache, no-store, must-revalidate",
+    "Pragma":                       "no-cache",
 }
 
 
@@ -441,6 +443,19 @@ def get_daily_plan() -> dict:
         return {}
 
 
+def clear_daily_plan() -> dict:
+    """Delete DAILY_PLAN and INTRADAY_PLAN from config table so next scanner run writes fresh data."""
+    table   = ddb.Table(CFG_TABLE)
+    cleared = []
+    for key in ("DAILY_PLAN", "INTRADAY_PLAN"):
+        try:
+            table.delete_item(Key={"config_key": key})
+            cleared.append(key)
+        except Exception as exc:
+            print(f"[dashboard_api] clear_daily_plan: could not delete {key}: {exc}")
+    return {"cleared": cleared, "timestamp": datetime.now(IST).isoformat()}
+
+
 def get_intraday_plan() -> dict:
     """Fetch today's intraday plan stored by the scanner at 9:30 AM."""
     try:
@@ -449,6 +464,104 @@ def get_intraday_plan() -> dict:
         return json.loads(raw) if raw else {}
     except Exception:
         return {}
+
+
+def get_paper_trades(days: int = 30) -> dict:
+    """
+    Return all paper trades (INTRADAY + ARB) for the last N days,
+    sorted newest-first, with per-trade P&L and running summary.
+    """
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    try:
+        resp  = ddb.Table(POS_TABLE).scan(
+            FilterExpression=Attr("mode").eq("PAPER") & Attr("timestamp").gte(cutoff)
+        )
+        items = resp.get("Items", [])
+    except Exception:
+        items = []
+
+    trades = []
+    total_pnl   = 0.0
+    total_trades = 0
+    wins = 0
+    losses = 0
+
+    for item in sorted(items, key=lambda x: x.get("timestamp", ""), reverse=True):
+        entry_ts  = item.get("timestamp", "")
+        exit_ts   = item.get("exit_timestamp", "")
+        status    = item.get("status", "OPEN")
+        trade_type = item.get("trade_type", "")
+        strategy_type = item.get("strategy_type", "")
+
+        # Duration
+        duration_str = ""
+        if entry_ts and exit_ts:
+            try:
+                t0 = datetime.fromisoformat(entry_ts)
+                t1 = datetime.fromisoformat(exit_ts)
+                mins = int((t1 - t0).total_seconds() / 60)
+                duration_str = f"{mins}m" if mins < 60 else f"{mins // 60}h {mins % 60}m"
+            except Exception:
+                pass
+
+        # P&L
+        pnl = None
+        if status == "CLOSED":
+            try:
+                pnl = float(item.get("exit_pnl", 0))
+                total_pnl += pnl
+                total_trades += 1
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+            except Exception:
+                pass
+
+        # Entry/exit premiums (intraday)
+        entry_premium = item.get("entry_premium", "")
+        exit_premium  = item.get("exit_premium", "")
+
+        trades.append({
+            "position_id":    item.get("position_id", ""),
+            "timestamp":      entry_ts,
+            "exit_timestamp": exit_ts,
+            "duration":       duration_str,
+            "strategy_type":  strategy_type,
+            "trade_type":     trade_type,
+            "status":         status,
+            "entry_premium":  entry_premium,
+            "exit_premium":   exit_premium,
+            "entry_mispricing": item.get("entry_mispricing", ""),
+            "atm_strike":     item.get("atm_strike", ""),
+            "call_symbol":    item.get("call_symbol", ""),
+            "put_symbol":     item.get("put_symbol", ""),
+            "qty":            item.get("qty", ""),
+            "sl_level":       item.get("sl_level", ""),
+            "target_level":   item.get("target_level", ""),
+            "exit_reason":    item.get("exit_reason", ""),
+            "pnl":            pnl,
+            "confidence":     item.get("confidence", ""),
+            "reason":         item.get("reason", ""),
+        })
+
+    win_rate = round(wins / total_trades * 100, 1) if total_trades > 0 else 0.0
+    avg_pnl  = round(total_pnl / total_trades, 2) if total_trades > 0 else 0.0
+
+    return {
+        "trades":        trades,
+        "summary": {
+            "total_trades":  total_trades,
+            "open_trades":   sum(1 for t in trades if t["status"] == "OPEN"),
+            "closed_trades": total_trades,
+            "wins":          wins,
+            "losses":        losses,
+            "win_rate_pct":  win_rate,
+            "total_pnl":     round(total_pnl, 2),
+            "avg_pnl":       avg_pnl,
+        },
+        "days": days,
+    }
 
 
 def get_volatility_history(limit: int = 60) -> list:
@@ -655,6 +768,185 @@ def get_portfolio_risk() -> dict:
     }
 
 
+def get_fii_intelligence() -> dict:
+    """
+    Return full FII intelligence: latest data + 5-day history + composite signal.
+    Reads from:
+      - nifty_config[FII_DII_LATEST]      — cash market data
+      - nifty_config[FII_FUTURES_LATEST]  — F&O participant OI
+      - nifty_fii_history                 — daily snapshots (5 days)
+    """
+    FII_HISTORY_TABLE = os.environ.get("FII_HISTORY_TABLE", "nifty_fii_history")
+
+    # ── Load latest FII cache from nifty_config ───────────────────────────────
+    cash_data    = {}
+    futures_data = {}
+    try:
+        resp = ddb.Table(CFG_TABLE).get_item(Key={"config_key": "FII_DII_LATEST"})
+        raw  = resp.get("Item", {}).get("config_value", "{}")
+        cash_data = json.loads(raw) if raw else {}
+    except Exception:
+        pass
+    try:
+        resp = ddb.Table(CFG_TABLE).get_item(Key={"config_key": "FII_FUTURES_LATEST"})
+        raw  = resp.get("Item", {}).get("config_value", "{}")
+        futures_data = json.loads(raw) if raw else {}
+    except Exception:
+        pass
+
+    # ── Load 5-day history from nifty_fii_history ─────────────────────────────
+    history = []
+    try:
+        cutoff = (date.today() - timedelta(days=10)).isoformat()
+        resp   = ddb.Table(FII_HISTORY_TABLE).scan(
+            FilterExpression=Attr("date").gte(cutoff)
+        )
+        items = resp.get("Items", [])
+        items.sort(key=lambda x: x.get("date", ""), reverse=True)
+        history = items[:5]
+    except Exception:
+        pass
+
+    # ── Compute trend metrics from history ────────────────────────────────────
+    trend_direction  = "NEUTRAL"
+    ls_ratio_trend   = "FLAT"
+    consecutive_days = 0
+    net_change_5d    = 0
+    score            = 0
+
+    if len(history) >= 2:
+        FII_FUT_LONG_THR  =  5000
+        FII_FUT_SHORT_THR = -5000
+        direction_days = []
+        ls_ratios      = []
+        for rec in history:
+            fut_net  = int(rec.get("fii_fut_net", 0))
+            ls_ratio = float(rec.get("fii_ls_ratio", 1.0))
+            ls_ratios.append(ls_ratio)
+            net_change_5d += fut_net
+            if fut_net >= FII_FUT_LONG_THR:
+                direction_days.append(1)
+            elif fut_net <= FII_FUT_SHORT_THR:
+                direction_days.append(-1)
+            else:
+                direction_days.append(0)
+        score = sum(direction_days)
+        trend_direction = "BULLISH" if score >= 2 else ("BEARISH" if score <= -2 else "NEUTRAL")
+        # Streak
+        streak_dir = direction_days[0]
+        consecutive_days = 1
+        if streak_dir != 0:
+            for d in direction_days[1:]:
+                if d == streak_dir:
+                    consecutive_days += 1
+                else:
+                    break
+        # L/S ratio trend
+        if len(ls_ratios) >= 3:
+            recent = sum(ls_ratios[:2]) / 2
+            older  = sum(ls_ratios[2:]) / len(ls_ratios[2:])
+            ls_ratio_trend = "RISING" if recent > older + 0.05 else ("FALLING" if recent < older - 0.05 else "FLAT")
+
+    # ── Cash vs Futures divergence ────────────────────────────────────────────
+    cash_sig = cash_data.get("signal",     "FII_NEUTRAL")
+    fut_sig  = futures_data.get("fut_signal", "FII_FUT_NEUTRAL")
+    fii_net_cr = float(cash_data.get("fii_net_cr", 0))
+    fut_net_latest = int(futures_data.get("fii_fut_net", 0))
+
+    if cash_sig == "FII_BEARISH" and fut_sig == "FII_FUT_SHORT":
+        divergence = "TRUE_EXIT"
+        divergence_explanation = f"FII selling cash (₹{fii_net_cr:+,.0f}Cr) AND futures ({fut_net_latest:+,d} contracts). Strong bearish."
+    elif cash_sig == "FII_BULLISH" and fut_sig == "FII_FUT_LONG":
+        divergence = "TRUE_ACCUMULATION"
+        divergence_explanation = f"FII buying cash (₹{fii_net_cr:+,.0f}Cr) AND futures long ({fut_net_latest:+,d} contracts). Strong bullish."
+    elif cash_sig == "FII_BEARISH" and fut_sig in ("FII_FUT_NEUTRAL", "FII_FUT_LONG"):
+        divergence = "HEDGING"
+        divergence_explanation = f"FII selling cash (₹{fii_net_cr:+,.0f}Cr) but futures neutral/long — likely hedging equity book. Not bearish."
+    else:
+        divergence = "NONE"
+        divergence_explanation = f"Cash: {cash_sig} (₹{fii_net_cr:+,.0f}Cr)  Futures: {fut_sig} ({fut_net_latest:+,d}). No clear conviction."
+
+    # ── Composite signal ──────────────────────────────────────────────────────
+    comp_score = 0
+    if fut_sig == "FII_FUT_LONG":    comp_score += 3
+    elif fut_sig == "FII_FUT_SHORT": comp_score -= 3
+    if trend_direction == "BULLISH": comp_score += min(consecutive_days, 3)
+    elif trend_direction == "BEARISH": comp_score -= min(consecutive_days, 3)
+    if ls_ratio_trend == "RISING":  comp_score += 1
+    elif ls_ratio_trend == "FALLING": comp_score -= 1
+    if divergence == "TRUE_ACCUMULATION": comp_score += 2
+    elif divergence == "TRUE_EXIT":       comp_score -= 2
+    opt_pcr = float(futures_data.get("fii_opt_pcr", 1.0))
+    if opt_pcr > 1.3: comp_score -= 1
+    elif opt_pcr < 0.7: comp_score += 1
+
+    if comp_score >= 5:
+        composite_direction = "BULLISH"
+        composite_confidence = "HIGH"
+        composite_action = "BULL_PUT_SPREAD or BULL_CALL_SPREAD — high institutional conviction"
+    elif comp_score >= 2:
+        composite_direction = "BULLISH"
+        composite_confidence = "MEDIUM"
+        composite_action = "BULL_PUT_SPREAD with 50% normal size"
+    elif comp_score <= -5:
+        composite_direction = "BEARISH"
+        composite_confidence = "HIGH"
+        composite_action = "BEAR_CALL_SPREAD — strong institutional sell signal"
+    elif comp_score <= -2:
+        composite_direction = "BEARISH"
+        composite_confidence = "MEDIUM"
+        composite_action = "BEAR_CALL_SPREAD with 50% normal size"
+    else:
+        composite_direction = "NEUTRAL"
+        composite_confidence = "LOW"
+        composite_action = "IRON_CONDOR or WAIT — no clear FII direction"
+
+    return {
+        # ── Today's snapshot ──────────────────────────────────────────────
+        "cash": {
+            "fii_net_cr":  fii_net_cr,
+            "fii_buy_cr":  float(cash_data.get("fii_buy_cr",  0)),
+            "fii_sell_cr": float(cash_data.get("fii_sell_cr", 0)),
+            "dii_net_cr":  float(cash_data.get("dii_net_cr",  0)),
+            "signal":      cash_sig,
+            "data_date":   cash_data.get("data_date", ""),
+        },
+        "futures": {
+            "fii_fut_net":   fut_net_latest,
+            "fii_fut_long":  int(futures_data.get("fii_fut_long",  0)),
+            "fii_fut_short": int(futures_data.get("fii_fut_short", 0)),
+            "fii_opt_pcr":   opt_pcr,
+            "ls_ratio":      round(int(futures_data.get("fii_fut_long", 0)) /
+                                   max(int(futures_data.get("fii_fut_short", 1)), 1), 3),
+            "signal":        fut_sig,
+            "data_date":     futures_data.get("data_date", ""),
+        },
+        # ── 5-day trend ───────────────────────────────────────────────────
+        "trend": {
+            "direction":       trend_direction,
+            "ls_ratio_trend":  ls_ratio_trend,
+            "consecutive_days": consecutive_days,
+            "net_change_5d":   net_change_5d,
+            "score":           score,
+        },
+        # ── Divergence ────────────────────────────────────────────────────
+        "divergence": {
+            "type":        divergence,
+            "explanation": divergence_explanation,
+        },
+        # ── Composite signal ──────────────────────────────────────────────
+        "composite": {
+            "direction":   composite_direction,
+            "confidence":  composite_confidence,
+            "score":       comp_score,
+            "action":      composite_action,
+        },
+        # ── History table ─────────────────────────────────────────────────
+        "history": history,
+        "timestamp": datetime.now(IST).isoformat(),
+    }
+
+
 def auth_status() -> dict:
     """Test broker connectivity. Returns {connected, broker, timestamp}."""
     ts = datetime.now(IST).isoformat()
@@ -728,6 +1020,12 @@ def lambda_handler(event, context):
             if path.endswith("/backtest"):
                 return _resp(get_backtest(int(qs.get("days", 30))))
 
+            if path.endswith("/paper-trades"):
+                return _resp(get_paper_trades(int(qs.get("days", 30))))
+
+            if path.endswith("/fii"):
+                return _resp(get_fii_intelligence())
+
             if path.endswith("/health"):
                 return _resp({"status": "ok", "mode": _get_effective_mode()})
 
@@ -750,6 +1048,9 @@ def lambda_handler(event, context):
             if path.endswith("/config"):
                 update_config(body)
                 return _resp({"updated": list(body.keys())})
+
+            if path.endswith("/daily-plan/clear"):
+                return _resp(clear_daily_plan())
 
     except Exception as exc:
         import traceback

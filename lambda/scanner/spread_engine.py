@@ -31,19 +31,23 @@ def get_active_futures(broker, underlying: str = UNDERLYING) -> dict:
     fut["expiry"] = pd.to_datetime(fut["expiry"])
     fut = fut[fut["expiry"] >= pd.Timestamp.now()].sort_values("expiry").reset_index(drop=True)
 
-    if len(fut) < 3:
+    if len(fut) < 2:
         raise RuntimeError(f"Only {len(fut)} active futures found for {underlying}")
+
+    # When only 2 contracts are available (e.g. right after month-end expiry before
+    # the exchange lists the 3rd month), alias far → next so spread2/curve_diff = 0.
+    far_idx = 2 if len(fut) >= 3 else 1
 
     return {
         "near":        fut.iloc[0]["symbol"],
         "near_token":  fut.iloc[0]["token"],
         "next":        fut.iloc[1]["symbol"],
         "next_token":  fut.iloc[1]["token"],
-        "far":         fut.iloc[2]["symbol"],
-        "far_token":   fut.iloc[2]["token"],
+        "far":         fut.iloc[far_idx]["symbol"],
+        "far_token":   fut.iloc[far_idx]["token"],
         "near_expiry": fut.iloc[0]["expiry"],
         "next_expiry": fut.iloc[1]["expiry"],
-        "far_expiry":  fut.iloc[2]["expiry"],
+        "far_expiry":  fut.iloc[far_idx]["expiry"],
     }
 
 

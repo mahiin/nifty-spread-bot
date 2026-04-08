@@ -12,9 +12,11 @@ Selection priority (highest wins):
   6. VOLATILITY + IV–VIX < -3          → BUY_STRADDLE
   7. FII_BEARISH + PCR_BEARISH + VIX rising → BEAR_CALL_SPREAD
   8. FII_BULLISH + PCR_BULLISH         → BULL_PUT_SPREAD
-  9. arb_signal != NONE                → ARB_SYNTHETIC
-  10. SPREAD + spread_signal + strength ≥ 2.5 → TRIPLE_CALENDAR
-  11. Otherwise                        → WAIT
+  9. MOMENTUM_LONG/SHORT (VWAP+EMA20+RSI triple confirm, VIX<22) ← NEW
+  10. arb_signal != NONE               → ARB_SYNTHETIC
+  11. TREND regime                     → BULL_CALL_SPREAD / BEAR_PUT_SPREAD
+  12. SPREAD + spread_signal + strength ≥ 2.5 → TRIPLE_CALENDAR
+  13. Otherwise                        → WAIT
 
 The output dict is designed to be displayed directly in the dashboard
 "Daily Plan" tab — plain-language action cards with specific symbols,
@@ -26,6 +28,7 @@ from datetime import date
 from typing import Optional
 
 import pytz
+from win_scorer import score_win_probability
 
 _IST = pytz.timezone("Asia/Kolkata")
 
@@ -43,6 +46,8 @@ class Strategy:
     BEAR_CALL_SPREAD = "BEAR_CALL_SPREAD"
     BULL_CALL_SPREAD = "BULL_CALL_SPREAD"
     BEAR_PUT_SPREAD  = "BEAR_PUT_SPREAD"
+    MOMENTUM_LONG    = "MOMENTUM_LONG"
+    MOMENTUM_SHORT   = "MOMENTUM_SHORT"
 
 
 # ─── Public API ─────────────────────────────────────────────────────────────
@@ -68,6 +73,9 @@ def build_daily_plan(
     day_of_week:   int    = -1,               # 0=Mon … 6=Sun  (-1 = unknown)
     dte:           int    = 14,               # days to near expiry
     event_dates:   list   = [],
+    momentum:      Optional[dict] = None,     # from momentum_engine.compute_momentum_signal()
+    vix:           float  = 0.0,              # raw VIX value (for win scorer)
+    fii_composite: Optional[dict] = None,     # from get_fii_composite_signal()
 ) -> dict:
     """
     Build the daily trading plan from all engine outputs.
@@ -309,7 +317,21 @@ def build_daily_plan(
             _leg("BUY",  1, f"{put_sym}-200", "MARKET", "PE"),
         ]
 
-    # ── 7.5. Trend regime → BULL_CALL_SPREAD or BEAR_PUT_SPREAD ─────────
+    # ── 7.5. Momentum (VWAP + EMA20 + RSI triple confirmation) ──────────
+    # Only when VIX < 22 and not HALT and not expiry day.
+    # Alert + DynamoDB only — user places the CE/PE manually.
+    elif (
+        momentum is not None
+        and momentum.get("signal") in ("MOMENTUM_LONG", "MOMENTUM_SHORT")
+        and momentum.get("confidence") in ("HIGH", "MEDIUM")
+        and safety.get("safe", False)
+        and day_of_week != 3          # not expiry day
+        and vix_val < 22.0
+    ):
+        strategy, legs, capital_est, reason, risk_note, emoji = \
+            _build_momentum_plan(momentum, vol, lot_size)
+
+    # ── 8. Trend regime → BULL_CALL_SPREAD or BEAR_PUT_SPREAD ───────────
     # Use when regime is TREND, conditions are safe, not Thu/Fri, DTE ≥ 2.
     # Direction determined by FII futures signal (gold standard) + spot slope.
     elif (
@@ -440,6 +462,24 @@ def build_daily_plan(
         legs = []
         capital_est = 0.0
 
+    # ── Momentum context fields (for display even when not the chosen strategy)
+    _mom = momentum or {}
+
+    # Build partial plan dict for win scorer (needs strategy + strength)
+    _partial = {"strategy": strategy, "strength": round(strength, 2)}
+    win_prob = score_win_probability(
+        plan           = _partial,
+        regime         = regime,
+        vol            = vol,
+        momentum       = momentum,
+        fii_fut_signal = fii_fut_signal,
+        pcr_signal     = pcr_signal,
+        vix            = vix if vix > 0 else vix_val,
+        day_of_week    = day_of_week,
+        safety         = safety,
+        fii_composite  = fii_composite,
+    )
+
     return {
         "strategy":        strategy,
         "strategy_emoji":  emoji,
@@ -457,6 +497,9 @@ def build_daily_plan(
         "qty":             qty,
         "vix":             round(vix_val, 2),
         "iv_vix_spread":   round(iv_spread, 2),
+        # ── Win probability ────────────────────────────────────────────
+        "win_probability":     win_prob,
+        "win_probability_pct": f"{win_prob * 100:.0f}%",
         # ── New context fields ─────────────────────────────────────────
         "fii_signal":      fii_signal,
         "pcr":             round(pcr, 3),
@@ -466,10 +509,51 @@ def build_daily_plan(
         "day_label":       day_label,
         "dte":             dte,
         "date":            date.today().isoformat(),
+        # ── Momentum Engine context ────────────────────────────────────
+        "momentum_signal":     _mom.get("signal", "NEUTRAL"),
+        "momentum_rsi":        round(float(_mom.get("rsi",   50)), 1),
+        "momentum_ema20":      round(float(_mom.get("ema20",  0)), 1),
+        "momentum_vwap":       round(float(_mom.get("vwap",   0)), 1),
+        "momentum_confidence": _mom.get("confidence", "LOW"),
+        "momentum_reason":     _mom.get("reason", ""),
     }
 
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
+
+def _build_momentum_plan(momentum: dict, vol: dict, lot_size: int):
+    """Return (strategy, legs, capital_est, reason, risk_note, emoji) for momentum trade."""
+    sig        = momentum["signal"]
+    conf       = momentum.get("confidence", "MEDIUM")
+    rsi        = momentum.get("rsi", 50)
+    ema20      = momentum.get("ema20", 0)
+    vwap       = momentum.get("vwap", 0)
+    mom_reason = momentum.get("reason", "")
+
+    is_long   = sig == "MOMENTUM_LONG"
+    strategy  = Strategy.MOMENTUM_LONG if is_long else Strategy.MOMENTUM_SHORT
+    emoji     = "🚀" if is_long else "🔻"
+    direction = "CE" if is_long else "PE"
+    opt_sym   = vol.get("call_symbol" if is_long else "put_symbol", f"ATM {direction}")
+
+    conf_label = "Strong" if conf == "HIGH" else "Moderate"
+    reason = (
+        f"{conf_label} momentum signal: {mom_reason}. "
+        f"RSI(14)={rsi:.1f}, EMA20={ema20:.0f}, VWAP={vwap:.0f}. "
+        f"Buy ATM {direction} to ride the intraday directional move. "
+        f"Alert only — place manually. Hard exit by 1:30 PM."
+    )
+    risk_note = (
+        f"Max loss = premium paid. "
+        f"SL: 25% of entry premium. Target: 40% of entry premium. "
+        f"Use 50% of normal lot size (higher gamma risk). "
+        f"Do NOT hold overnight."
+    )
+    # Capital estimate: ~150 pts × lot_size as rough premium placeholder
+    capital_est = float(lot_size) * 150.0
+    legs = [_leg("BUY", 1, opt_sym, "MARKET", direction)]
+    return strategy, legs, capital_est, reason, risk_note, emoji
+
 
 def _leg(
     action:  str,         # BUY | SELL

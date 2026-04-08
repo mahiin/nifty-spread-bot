@@ -102,7 +102,7 @@ def check_and_exit_options_positions(
 
         order_ids = _execute_options_close(broker, pos)
         pnl       = _calc_options_pnl(trade_type, entry_premium, current_prem, qty)
-        _mark_closed(pos["position_id"], pnl, reason)
+        _mark_closed(pos["position_id"], pnl, reason, exit_premium=round(current_prem, 2))
         _write_pnl(pnl)
 
         events.append({
@@ -469,21 +469,26 @@ def _get_open_positions() -> list[dict]:
         return []
 
 
-def _mark_closed(position_id: str, pnl: float, reason: str) -> None:
+def _mark_closed(position_id: str, pnl: float, reason: str,
+                 exit_premium: Optional[float] = None) -> None:
     try:
+        update_expr = (
+            "SET #s = :s, exit_pnl = :p, exit_reason = :r, exit_timestamp = :t"
+        )
+        attr_vals = {
+            ":s": "CLOSED",
+            ":p": str(round(pnl, 2)),
+            ":r": reason,
+            ":t": datetime.now(IST).isoformat(),
+        }
+        if exit_premium is not None:
+            update_expr += ", exit_premium = :ep"
+            attr_vals[":ep"] = str(round(exit_premium, 2))
         _ddb.Table(POS_TABLE).update_item(
             Key={"position_id": position_id},
-            UpdateExpression=(
-                "SET #s = :s, exit_pnl = :p, exit_reason = :r, "
-                "exit_timestamp = :t"
-            ),
+            UpdateExpression=update_expr,
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={
-                ":s": "CLOSED",
-                ":p": str(round(pnl, 2)),
-                ":r": reason,
-                ":t": datetime.now(IST).isoformat(),
-            },
+            ExpressionAttributeValues=attr_vals,
         )
     except Exception as e:
         print(f"[position_monitor] Could not mark closed {position_id}: {e}")

@@ -1,7 +1,7 @@
 """
 NIFTY Triple Calendar Spread – Scanner Lambda
 =============================================
-Triggered every 30 s by EventBridge during market hours.
+Triggered every 15 min by EventBridge (9:45–11:00 AM IST strategy window, then monitors only).
 
 What it does:
   1.  Auto-detects near / next / far NIFTY futures
@@ -66,7 +66,9 @@ from volatility_engine   import compute_volatility_signal
 from strategy_router     import build_daily_plan
 from intraday_advisor    import build_intraday_plan
 from fii_dii_engine      import (fetch_fii_dii, get_fii_dii_signal,
-                                  fetch_fii_futures, get_fii_futures_signal)
+                                  fetch_fii_futures, get_fii_futures_signal,
+                                  store_daily_fii_snapshot, get_fii_trend,
+                                  get_fii_composite_signal)
 from option_chain_engine import fetch_option_chain, get_iron_condor_strikes
 from iron_condor         import build_iron_condor_plan, ic_entry_allowed
 from greeks_engine       import compute_position_greeks
@@ -129,6 +131,7 @@ def _fetch_scan_history(lookback: int) -> tuple[list, list]:
 def _store_daily_plan(plan: dict) -> None:
     """Persist latest daily plan as a JSON string in DynamoDB config table."""
     try:
+        plan["generated_at"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M IST")
         cfg_tbl.put_item(Item={
             "config_key":   "DAILY_PLAN",
             "config_value": json.dumps(plan),
@@ -148,14 +151,15 @@ def _store_intraday_plan(plan: dict) -> None:
         pass
 
 
-def _execute_intraday_paper(plan: dict, call_price: float, put_price: float) -> None:
+def _execute_intraday_paper(plan: dict, call_price: float, put_price: float) -> bool:
     """
     Record a paper intraday position in DynamoDB.
-    Called once at 9:30 AM when INTRADAY_AUTO_EXECUTE=true.
-    Stores entry premiums so the position monitor can track SL/target/time exit.
+    Called every scan when INTRADAY_AUTO_EXECUTE=true and strategy != WAIT.
+    Dedup guard ensures only one open INTRADAY position at a time.
+    Returns True if a new position was created, False if skipped.
     """
     trade_type = plan["strategy"]
-    # Skip if already an open intraday position today
+    # Skip if already an open intraday position
     try:
         from boto3.dynamodb.conditions import Attr
         resp = ddb.Table(os.environ.get("POSITIONS_TABLE", "nifty_positions")).scan(
@@ -166,7 +170,7 @@ def _execute_intraday_paper(plan: dict, call_price: float, put_price: float) -> 
         )
         if resp.get("Count", 0) > 0:
             print("[intraday] Position already open — skipping paper execute")
-            return
+            return False
     except Exception:
         pass
 
@@ -204,6 +208,8 @@ def _execute_intraday_paper(plan: dict, call_price: float, put_price: float) -> 
         "status":         "OPEN",
         "mode":           "PAPER",
         "entry_premium":  str(entry_premium),
+        "entry_call_price": str(call_price),
+        "entry_put_price":  str(put_price),
         "sl_pct":         "0.25",
         "target_pct":     "0.40",
         "sl_level":       str(sl_level),
@@ -220,23 +226,62 @@ def _execute_intraday_paper(plan: dict, call_price: float, put_price: float) -> 
         "reason":         plan.get("reason", "")[:200],
     })
     print(f"[intraday] Paper position recorded: {pos_id} | entry_premium={entry_premium} | SL={sl_level} | Target={target_lvl}")
+    return True
 
 
-def _intraday_plan_needed() -> bool:
-    """
-    Return True only during the 9:15–9:35 AM IST window AND if today's
-    plan hasn't been generated yet. Ensures the plan fires once per day.
-    """
+def _within_market_hours() -> bool:
+    """Return True during 9:15 AM – 14:30 PM IST (entry window for intraday)."""
+    now  = datetime.now(IST)
+    mins = now.hour * 60 + now.minute
+    return 9 * 60 + 15 <= mins <= 14 * 60 + 30
+
+
+def _is_before_decision_window() -> bool:
+    """Return True before 9:45 AM IST — opening 30 min is too noisy."""
     now = datetime.now(IST)
-    if not (9 * 60 + 15 <= now.hour * 60 + now.minute <= 9 * 60 + 35):
+    return now.hour * 60 + now.minute < 9 * 60 + 45
+
+
+def _is_past_decision_deadline() -> bool:
+    """Return True at/after 11:00 AM IST — strategy window has closed."""
+    now = datetime.now(IST)
+    return now.hour * 60 + now.minute >= 11 * 60
+
+
+def _is_strategy_decided_today() -> bool:
+    """Return True if a strategy decision (or WAIT) was already made today."""
+    try:
+        resp = cfg_tbl.get_item(Key={"config_key": "STRATEGY_DECIDED_DATE"})
+        last = resp.get("Item", {}).get("config_value", "")
+        return last == datetime.now(IST).strftime("%Y-%m-%d")
+    except Exception:
         return False
+
+
+def _mark_strategy_decided() -> None:
+    """Persist today's date to prevent re-evaluation after a decision is made."""
+    try:
+        cfg_tbl.put_item(Item={
+            "config_key":   "STRATEGY_DECIDED_DATE",
+            "config_value": datetime.now(IST).strftime("%Y-%m-%d"),
+        })
+    except Exception:
+        pass
+
+
+def _get_stored_intraday_strategy() -> str:
+    """Return the last stored intraday plan's strategy (for change-detection alerting)."""
     try:
         resp = cfg_tbl.get_item(Key={"config_key": "INTRADAY_PLAN"})
         raw  = resp.get("Item", {}).get("config_value", "{}")
         plan = json.loads(raw) if raw else {}
-        return plan.get("date") != now.strftime("%Y-%m-%d")
+        # Only treat as "same day" if the stored plan is from today
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        if plan.get("date") == today:
+            return plan.get("strategy", "")
+        return ""   # new day — treat as changed
     except Exception:
-        return True
+        return ""
 
 
 def _signal_key(record: dict) -> str:
@@ -388,6 +433,50 @@ def _paper_trade_arb(record: dict) -> None:
         print(f"[arb] Paper trade record failed: {exc}")
 
 
+def _run_quick_position_monitors() -> None:
+    """
+    Lightweight position monitor — runs on every Lambda invocation even when the
+    full strategy pipeline is skipped (e.g. before 10 AM, or after strategy decided).
+    Checks and exits spread/arb/options positions based on current market prices.
+    Non-fatal: any exception is caught and logged.
+    """
+    try:
+        _broker = get_broker()
+        _cdiff, _dte = 0.0, 30
+        _cprice, _pprice = 0.0, 0.0
+        try:
+            _fut = get_active_futures(_broker, UNDERLYING)
+            _q   = _broker.get_quote([
+                f"NFO:{_fut['near_token']}",
+                f"NFO:{_fut['next_token']}",
+                f"NFO:{_fut['far_token']}",
+            ])
+            _n  = float(_q[f"NFO:{_fut['near']}"]["ltp"])
+            _nx = float(_q[f"NFO:{_fut['next']}"]["ltp"])
+            _f  = float(_q[f"NFO:{_fut['far']}"]["ltp"])
+            _cdiff = compute_spreads(_n, _nx, _f)["curve_diff"]
+            _dte   = days_to_expiry(_fut["near_expiry"])
+            # Get ATM option prices for options monitor
+            _arb_m = __import__("arbitrage_engine")
+            _spot  = _n  # use near futures as spot approximation
+            _arb   = _arb_m.check_parity(_broker, _fut, _spot, _q)
+            _cprice = float(_arb.get("call_price", 0))
+            _pprice = float(_arb.get("put_price",  0))
+        except Exception as _qe:
+            print(f"[monitors] Quote fetch skipped: {_qe}")
+        # Spread / arb exits
+        _exits = check_and_exit_positions(_broker, _cdiff, _dte)
+        if _exits:
+            send_exit_alert(_exits)
+        # Options / intraday exits
+        _opt_exits = check_and_exit_options_positions(_broker, _cprice + _pprice)
+        if _opt_exits:
+            _mode = _load_config().get("MODE", "PAPER")
+            send_options_exit_alert(_opt_exits, mode=_mode)
+    except Exception as _me:
+        print(f"[monitors] Quick monitor error (non-fatal): {_me}")
+
+
 def lambda_handler(event, context):
     # Load config first so we can check holidays before doing anything else
     cfg = _load_config()
@@ -415,7 +504,6 @@ def lambda_handler(event, context):
                 _dte    = 30
                 try:
                     _fut = get_active_futures(_broker, UNDERLYING)
-                    from spread_engine import compute_spreads, days_to_expiry
                     _q   = _broker.get_quote([
                         f"NFO:{_fut['near_token']}",
                         f"NFO:{_fut['next_token']}",
@@ -448,6 +536,23 @@ def lambda_handler(event, context):
                 print(f"[post-cutoff monitor] Error: {_e}")
         return {"statusCode": 200, "body": "Past entry cutoff — monitors ran"}
 
+    # ── 9:45 AM noise gate ───────────────────────────────────────────────────
+    # 9:15–9:45 AM is high-noise opening range. Skip strategy evaluation,
+    # but still run position monitors so any open positions are watched.
+    if _is_before_decision_window():
+        _run_quick_position_monitors()
+        now_str = datetime.now(IST).strftime("%H:%M")
+        print(f"[scanner] Before 9:45 AM ({now_str} IST) — monitors ran, strategy skipped")
+        return {"statusCode": 200, "body": f"Before decision window ({now_str} IST)"}
+
+    # ── One-shot guard ────────────────────────────────────────────────────────
+    # Once a strategy decision is made (or WAIT declared at 11 AM), skip the
+    # expensive full pipeline. Only run monitors to watch existing positions.
+    if _is_strategy_decided_today():
+        _run_quick_position_monitors()
+        print("[scanner] Strategy already decided today — monitors ran, pipeline skipped")
+        return {"statusCode": 200, "body": "Strategy decided for today — monitors ran"}
+
     # cfg already loaded above for holiday check — use it directly
     ZSCORE_THRESH = float(cfg["ZSCORE_THRESHOLD"])
     LOOKBACK      = int(cfg["LOOKBACK_WINDOW"])
@@ -472,21 +577,29 @@ def lambda_handler(event, context):
 
         futures = get_active_futures(broker, UNDERLYING)
 
-        # ── Live quotes (pass token IDs; response keyed by symbol) ─────────
+        # ── Live quotes (NFO futures only — keep NSE spot separate to avoid
+        #    mixed-exchange batch failures on Angel One's quote API) ─────────
         instruments = [
             f"NFO:{futures['near_token']}",
             f"NFO:{futures['next_token']}",
             f"NFO:{futures['far_token']}",
-            "NSE:26000",   # NIFTY 50 spot token
         ]
         quotes = broker.get_quote(instruments)
 
         near_price  = float(quotes[f"NFO:{futures['near']}"]["ltp"])
         next_price  = float(quotes[f"NFO:{futures['next']}"]["ltp"])
         far_price   = float(quotes[f"NFO:{futures['far']}"]["ltp"])
-        spot_ohlc   = quotes.get("NSE:NIFTY", {})
-        spot_price  = float((spot_ohlc or {}).get("ltp") or near_price)
 
+        # Fetch Nifty 50 spot (OHLC) separately — non-critical, falls back to near_price
+        spot_ohlc: dict = {}
+        try:
+            _spot_data = broker.get_quote(["NSE:26000"])
+            # Angel One returns tradingSymbol like "Nifty 50" — grab first result
+            spot_ohlc = next(iter(_spot_data.values()), {}) if _spot_data else {}
+        except Exception as _e:
+            print(f"[scanner] Spot OHLC fetch failed (non-fatal): {_e}")
+
+        spot_price  = float((spot_ohlc or {}).get("ltp") or near_price)
         intraday_high = float((spot_ohlc or {}).get("high") or spot_price)
         intraday_low  = float((spot_ohlc or {}).get("low")  or spot_price)
         prev_close    = float((spot_ohlc or {}).get("close") or 0)
@@ -604,6 +717,25 @@ def lambda_handler(event, context):
             lot_size    = LOT_SIZE,
         )
 
+        # ── Momentum Engine (VWAP + EMA20 + RSI) ─────────────────────────
+        momentum_data = {"signal": "NEUTRAL", "rsi": 50.0, "ema20": 0.0, "vwap": 0.0,
+                         "candle_count": 0, "confidence": "LOW", "reason": ""}
+        try:
+            from momentum_engine import compute_momentum_signal
+            momentum_data = compute_momentum_signal(
+                broker        = broker,
+                near_token    = futures["near_token"],
+                spot_price    = spot_price,
+                vix           = vix or 0.0,
+                iv_vix_spread = vol_data_iv.get("iv_vix_spread", 0.0),
+                lot_size      = LOT_SIZE,
+            )
+            print(f"[scanner] momentum_engine: signal={momentum_data['signal']} "
+                  f"rsi={momentum_data['rsi']} ema20={momentum_data['ema20']} "
+                  f"vwap={momentum_data['vwap']} conf={momentum_data['confidence']}")
+        except Exception as _me:
+            print(f"[scanner] momentum_engine failed (non-fatal): {_me}")
+
         # ── Day-of-week + Institutional Flow (FII/DII) ───────────────────
         day_of_week  = _get_day_of_week()
         fii_data     = fetch_fii_dii()
@@ -611,6 +743,25 @@ def lambda_handler(event, context):
         # FII F&O: index futures net long/short — the gold standard signal
         fii_fut_data = fetch_fii_futures()
         fii_fut_sig  = get_fii_futures_signal(fii_fut_data)
+
+        # ── FII 3-5 Day Trend + Composite Signal ─────────────────────────
+        # Store today's snapshot (idempotent, non-fatal) then compute trend
+        fii_composite = {"direction": "NEUTRAL", "confidence": "LOW", "score": 0,
+                         "divergence": "NONE", "consecutive_days": 0}
+        fii_trend     = {}
+        try:
+            store_daily_fii_snapshot(fii_data, fii_fut_data)
+            fii_trend     = get_fii_trend(days=5)
+            fii_composite = get_fii_composite_signal(fii_data, fii_fut_data, fii_trend)
+            print(
+                f"[fii] composite={fii_composite['direction']} "
+                f"conf={fii_composite['confidence']} score={fii_composite['score']} "
+                f"trend={fii_trend.get('trend_direction','?')} "
+                f"streak={fii_trend.get('consecutive_days',0)}d "
+                f"divergence={fii_composite['divergence']}"
+            )
+        except Exception as _fe:
+            print(f"[fii] Trend analysis failed (non-fatal): {_fe}")
 
         # ── Option Chain: PCR, Max Pain, OI Walls (15-min cache) ─────────
         chain_data  = fetch_option_chain()
@@ -723,8 +874,47 @@ def lambda_handler(event, context):
             day_of_week      = day_of_week,
             dte              = dte,
             event_dates      = event_dates,
+            momentum         = momentum_data,
+            vix              = vix or 0.0,
+            fii_composite    = fii_composite,
         )
         _store_daily_plan(daily_plan)
+
+        # ── Win Probability Gate (10 AM–11 AM one-shot decision) ──────────────
+        win_prob = daily_plan.get("win_probability", 0.0)
+        strategy = daily_plan.get("strategy", "WAIT")
+        print(f"[scanner] Strategy={strategy} win_prob={win_prob:.1%}")
+
+        if win_prob >= 0.80 and strategy != "WAIT":
+            # High-conviction signal — alert, execute, mark done for the day
+            print(f"[scanner] HIGH-CONVICTION signal ({win_prob:.1%}) — executing {strategy}")
+            _mark_strategy_decided()
+            # Alert via Telegram with win probability prominently shown
+            try:
+                send_telegram(
+                    f"✅ HIGH-CONVICTION STRATEGY ({win_prob:.0%} win probability)\n"
+                    f"Strategy: {daily_plan.get('strategy_emoji','')} {strategy}\n"
+                    f"{daily_plan.get('reason','')}\n"
+                    f"Risk: {daily_plan.get('risk_note','')}\n"
+                    f"Legs:\n{daily_plan.get('legs_text','')}"
+                )
+            except Exception as _ae:
+                print(f"[scanner] Telegram alert failed: {_ae}")
+        elif _is_past_decision_deadline():
+            # 11 AM passed with no high-conviction signal — WAIT for the day
+            print(f"[scanner] Past 11 AM deadline, best was {strategy} at {win_prob:.1%} — WAIT today")
+            _mark_strategy_decided()
+            try:
+                send_telegram(
+                    f"⏸️ NO TRADE TODAY\n"
+                    f"Best signal: {strategy} at {win_prob:.0%} (threshold: 80%)\n"
+                    f"Decision window (10–11 AM) closed. Staying flat for the day."
+                )
+            except Exception as _ae:
+                print(f"[scanner] WAIT telegram alert failed: {_ae}")
+        else:
+            # Still in window but below threshold — keep scanning, no alert yet
+            print(f"[scanner] Below 80% threshold ({win_prob:.1%}) — will retry before 11 AM")
 
         # ── Intraday Advisor (fires once at 9:30 AM IST) ──────────────────
         INTRADAY_AUTO_EXECUTE = cfg.get(
@@ -732,7 +922,12 @@ def lambda_handler(event, context):
             os.environ.get("INTRADAY_AUTO_EXECUTE", "true"),
         ).lower() == "true"
 
-        if _intraday_plan_needed():
+        # ── Intraday Advisor — re-evaluates every scan during market hours ──
+        # Entry is allowed any time 9:15 AM–2:30 PM (not locked to 9:30 window).
+        # Telegram alert fires only when strategy changes; execution alert fires
+        # only when a new position is actually created (dedup guard prevents dups).
+        if _within_market_hours():
+            prev_strategy  = _get_stored_intraday_strategy()
             vix_prev       = _get_prev_vix()
             intraday_plan  = build_intraday_plan(
                 spot_price    = spot_price,
@@ -748,17 +943,27 @@ def lambda_handler(event, context):
                 put_symbol    = put_sym_atm,
                 lot_size      = LOT_SIZE,
                 safety_regime = safety.get("regime", "SAFE"),
+                rsi           = momentum_data.get("rsi",   50.0),
+                vwap          = momentum_data.get("vwap",   0.0),
+                ema20         = momentum_data.get("ema20",  0.0),
             )
             _store_intraday_plan(intraday_plan)
-            send_intraday_alert(intraday_plan)
-            print(f"[intraday] Plan generated: {intraday_plan['strategy']} "
-                  f"(confidence={intraday_plan['confidence']})")
 
-            # ── Paper-execute the intraday plan ───────────────────────────
+            # Alert only when strategy changes (avoid Telegram spam every 30s)
+            if intraday_plan["strategy"] != prev_strategy:
+                send_intraday_alert(intraday_plan)
+                print(f"[intraday] Strategy changed: {prev_strategy!r} → {intraday_plan['strategy']!r} "
+                      f"(confidence={intraday_plan['confidence']})")
+            else:
+                print(f"[intraday] Plan unchanged: {intraday_plan['strategy']} "
+                      f"(confidence={intraday_plan['confidence']})")
+
+            # Paper-execute whenever strategy is actionable and no position is open
             if INTRADAY_AUTO_EXECUTE and intraday_plan["strategy"] != "WAIT":
-                _execute_intraday_paper(intraday_plan, atm_call_price, atm_put_price)
-                order_ids = [leg.get("symbol", "") for leg in intraday_plan.get("legs", [])]
-                send_intraday_execution_alert(intraday_plan, order_ids, mode="PAPER")
+                entered = _execute_intraday_paper(intraday_plan, atm_call_price, atm_put_price)
+                if entered:
+                    order_ids = [leg.get("symbol", "") for leg in intraday_plan.get("legs", [])]
+                    send_intraday_execution_alert(intraday_plan, order_ids, mode="PAPER")
 
         # ── Options position monitor (runs every scan) ────────────────────
         options_exits = check_and_exit_options_positions(
@@ -858,6 +1063,13 @@ def lambda_handler(event, context):
             "fii_fut_long":     str(fii_fut_data.get("fii_fut_long", 0)),
             "fii_fut_short":    str(fii_fut_data.get("fii_fut_short", 0)),
             "fii_opt_pcr":      str(fii_fut_data.get("fii_opt_pcr", 1.0)),
+            # ── FII Composite + Trend ─────────────────────────────────────
+            "fii_composite_dir":   fii_composite.get("direction",     "NEUTRAL"),
+            "fii_composite_conf":  fii_composite.get("confidence",    "LOW"),
+            "fii_composite_score": str(fii_composite.get("score",     0)),
+            "fii_trend_dir":       fii_trend.get("trend_direction",   "NEUTRAL"),
+            "fii_consecutive_days":str(fii_trend.get("consecutive_days", 0)),
+            "fii_divergence":      fii_composite.get("divergence",    "NONE"),
             "pcr":              str(round(pcr, 3)),
             "pcr_signal":       pcr_signal,
             "max_pain":         str(max_pain),
@@ -865,6 +1077,11 @@ def lambda_handler(event, context):
             "put_wall":         str(put_wall),
             "iv_skew":          str(iv_skew),
             "iv_skew_signal":   iv_skew_sig,
+            # ── Momentum Engine ───────────────────────────────────────────
+            "momentum_signal":  momentum_data.get("signal", "NEUTRAL"),
+            "rsi":              str(round(momentum_data.get("rsi",   50.0), 1)),
+            "ema20":            str(round(momentum_data.get("ema20",  0.0), 1)),
+            "vwap":             str(round(momentum_data.get("vwap",   0.0), 1)),
             # ── Daily Plan (summary) ──────────────────────────────────────
             "daily_strategy":   daily_plan["strategy"],
             "daily_plan_legs":  daily_plan["legs_text"],

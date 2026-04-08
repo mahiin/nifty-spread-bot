@@ -21,21 +21,25 @@ import boto3
 import pyotp
 import pytz
 import requests
-import pandas as pd
 
 IST = pytz.timezone("Asia/Kolkata")
 
 # ─── Secrets Manager helper ────────────────────────────────────────────────
 
 _secrets_cache: dict = {}
+_secrets_fetched_at: float = 0.0
+_SECRETS_TTL: float = 300.0  # re-fetch from Secrets Manager every 5 minutes
 
 def _get_secret(secret_key: str, env_fallback: str) -> str:
     """
     Read a secret from AWS Secrets Manager if SECRETS_MANAGER_NAME is set,
     otherwise fall back to the environment variable.
-    Results are cached per Lambda container lifetime.
+    Cache is refreshed every 5 minutes so credential updates take effect quickly.
     """
-    if secret_key in _secrets_cache:
+    import time
+    global _secrets_fetched_at
+    cache_expired = (time.time() - _secrets_fetched_at) > _SECRETS_TTL
+    if secret_key in _secrets_cache and not cache_expired:
         return _secrets_cache[secret_key]
 
     secret_name = os.environ.get("SECRETS_MANAGER_NAME", "")
@@ -47,6 +51,7 @@ def _get_secret(secret_key: str, env_fallback: str) -> str:
             data = json.loads(resp["SecretString"])
             # Cache all secrets from this response
             _secrets_cache.update(data)
+            _secrets_fetched_at = time.time()
             if secret_key in _secrets_cache:
                 return _secrets_cache[secret_key]
         except Exception as e:
@@ -134,7 +139,8 @@ class ZerodhaBroker:
         r.raise_for_status()
         return r.json().get("data", {})
 
-    def get_instruments(self, exchange="NFO") -> pd.DataFrame:
+    def get_instruments(self, exchange="NFO"):
+        import pandas as pd
         r = requests.get(f"{self.BASE_URL}/instruments/{exchange}",
                          headers=self.headers, timeout=10)
         r.raise_for_status()
@@ -180,6 +186,12 @@ class ZerodhaBroker:
                           headers=self.headers, data=payload, timeout=5)
         r.raise_for_status()
         return r.json()["data"]["order_id"]
+
+    def get_candles(self, token: str, exchange: str = "NFO",
+                    interval: str = "FIVE_MINUTE",
+                    from_dt: str = None, to_dt: str = None) -> list:
+        """Stub — Zerodha candle fetch not needed; momentum engine uses Angel One only."""
+        return []
 
     def get_positions(self) -> dict:
         return self._get("/portfolio/positions")
@@ -252,28 +264,76 @@ class AngelOneBroker:
             "X-PrivateKey":     self.api_key,
         }
 
+    # Angel One error codes that mean the JWT has been invalidated
+    _AUTH_ERROR_CODES = {"AB1010", "AB1004", "AG8001", "AG8002"}
+
     def _auth_headers(self) -> dict:
         return {**self._base_headers(), "Authorization": f"Bearer {self.jwt_token}"}
 
-    def _get(self, path: str, params: dict = None) -> dict:
+    def _is_auth_error(self, resp: dict) -> bool:
+        """Return True if the API response indicates an auth/session failure."""
+        errorcode = resp.get("errorcode") or ""
+        message   = resp.get("message")  or ""
+        # Explicit known auth error codes
+        if str(errorcode) in self._AUTH_ERROR_CODES:
+            return True
+        # Angel One often returns status=false, message=None on expired JWT
+        if not resp.get("status") and not message:
+            return True
+        return False
+
+    def _refresh_auth(self) -> None:
+        """Force a fresh TOTP login, update self.jwt_token, and save to DynamoDB."""
+        print("[broker_client] Auth failure detected — forcing fresh TOTP login")
+        # Invalidate DynamoDB cache so the next scanner invocation also re-logs in
+        try:
+            _get_token_table().delete_item(Key={"config_key": _DDB_TOKEN_KEY})
+        except Exception as e:
+            print(f"[broker_client] Could not clear cached token ({e})")
+
+        client_id   = _get_secret("ANGEL_CLIENT_ID",   "ANGEL_CLIENT_ID")
+        password    = _get_secret("ANGEL_PASSWORD",    "ANGEL_PASSWORD")
+        totp_secret = _get_secret("ANGEL_TOTP_SECRET", "ANGEL_TOTP_SECRET")
+        totp        = pyotp.TOTP(totp_secret).now()
+        session     = self._generate_session(client_id, password, totp)
+        save_angel_session(session)
+        self.jwt_token     = session["jwtToken"]
+        self.refresh_token = session["refreshToken"]
+        self.feed_token    = session.get("feedToken", "")
+        print("[broker_client] Fresh login successful, token updated")
+
+    def _get(self, path: str, params: dict = None, _retry: bool = True) -> dict:
         r = requests.get(f"{self.BASE_URL}{path}", headers=self._auth_headers(),
                          params=params, timeout=5)
         r.raise_for_status()
         resp = r.json()
         if not resp.get("status"):
-            raise RuntimeError(f"Angel One API error: {resp.get('message')}")
+            if _retry and self._is_auth_error(resp):
+                self._refresh_auth()
+                return self._get(path, params=params, _retry=False)
+            raise RuntimeError(
+                f"Angel One API error: message={resp.get('message')!r} "
+                f"errorcode={resp.get('errorcode')!r} path={path}"
+            )
         return resp.get("data", {})
 
-    def _post(self, path: str, payload: dict) -> dict:
+    def _post(self, path: str, payload: dict, _retry: bool = True) -> dict:
         r = requests.post(f"{self.BASE_URL}{path}", headers=self._auth_headers(),
                           json=payload, timeout=5)
         r.raise_for_status()
         resp = r.json()
         if not resp.get("status"):
-            raise RuntimeError(f"Angel One API error: {resp.get('message')}")
+            if _retry and self._is_auth_error(resp):
+                self._refresh_auth()
+                return self._post(path, payload=payload, _retry=False)
+            raise RuntimeError(
+                f"Angel One API error: message={resp.get('message')!r} "
+                f"errorcode={resp.get('errorcode')!r} path={path}"
+            )
         return resp.get("data", {})
 
-    def get_instruments(self, exchange: str = "NFO") -> pd.DataFrame:
+    def get_instruments(self, exchange: str = "NFO"):
+        import pandas as pd
         url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
         r = requests.get(url, timeout=15)
         r.raise_for_status()
@@ -344,6 +404,38 @@ class AngelOneBroker:
             }
         except Exception:
             return {"available_cash": 0.0, "used_margin": 0.0}
+
+    def get_candles(self, token: str, exchange: str = "NFO",
+                    interval: str = "FIVE_MINUTE",
+                    from_dt: str = None, to_dt: str = None) -> list:
+        """Fetch OHLCV candles via Angel One getCandleData.
+        Returns [[ts, open, high, low, close, volume], ...] or [] on failure.
+        """
+        from datetime import datetime as _dt
+        now = _dt.now(IST)
+        if not to_dt:
+            to_dt = now.strftime("%Y-%m-%d %H:%M")
+        if not from_dt:
+            market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+            from_dt = market_open.strftime("%Y-%m-%d %H:%M")
+        params = {
+            "exchange":    exchange,
+            "symboltoken": str(token),
+            "interval":    interval,
+            "fromdate":    from_dt,
+            "todate":      to_dt,
+        }
+        try:
+            resp = self._post(
+                "/rest/secure/angelbroking/historical/v1/getCandleData", params
+            )
+            # Angel One returns data directly (list of candles) on success
+            if isinstance(resp, list):
+                return resp
+            return []
+        except Exception as e:
+            print(f"[broker_client] get_candles failed: {e}")
+            return []
 
     def get_positions(self) -> dict:
         return self._get("/rest/secure/angelbroking/order/v1/getPosition")
